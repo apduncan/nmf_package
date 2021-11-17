@@ -57,16 +57,17 @@ class NMFModelSelection(ABC):
     ABS_K_MIN: int = 2
     DEF_K_MIN: int = 2
     DEF_K_MAX: int = 15
+    DEF_K_INTERVAL: int = 1
     DEF_ITERATIONS: int = 50
     DEF_NMF_MAX_ITER = 1000
     SOLVERS: List[str] = ['cd', 'mu']
     BETA_LOSS: List[str] = ['frobenius', 'kullback-leibler', 'itakura-saito']
     INIT: List[str] = ['random', 'nndsvd', 'nndsvda', 'nndsvdar']
 
-    def __init__(self, data: pd.DataFrame, k_min: int = None, k_max: int = None,
-                 solver: str = None, beta_loss: str = None, iterations: int = None, nmf_max_iter=None,
-                 normalise: Callable[[pd.DataFrame, float], pd.DataFrame] = None, normalise_arg: float = None,
-                 filter_fn=None, filter_threshold: float = None, metric: str = None) -> None:
+    def __init__(self, data: pd.DataFrame, k_min: int = None, k_max: int = None, k_interval: int = None,
+                 k_values: List[int] = None, solver: str = None, beta_loss: str = None, iterations: int = None,
+                 nmf_max_iter=None, normalise: Callable[[pd.DataFrame, float], pd.DataFrame] = None,
+                 normalise_arg: float = None, filter_fn=None, filter_threshold: float = None, metric: str = None) -> None:
         """Intialise a model selection object ready to be run.
 
         :param data: training data
@@ -75,6 +76,10 @@ class NMFModelSelection(ABC):
         :type k_min: int
         :param k_max:value to search k to
         :type k_max: int
+        :param k_interval: interval between values of k, equivalent to range(1, 10, k)
+        :type k_interval: int
+        :param k_values: values of k to search. If None, will create a list from k_min, k_max, k_interval
+        :type k_values: List[str]
         :param solver: nmf solver method
         :type solver: str
         :param beta_loss: beta loss function
@@ -96,6 +101,8 @@ class NMFModelSelection(ABC):
         """
         self.k_min = k_min
         self.k_max = k_max
+        self.k_interval = k_interval
+        self.k_values = k_values
         self.solver = solver
         self.beta_loss = beta_loss
         self.iterations = iterations
@@ -149,6 +156,34 @@ class NMFModelSelection(ABC):
         # Set to passed value, or the minimum degree if the minimum is larger
         # than the requested max value
         self.__k_max: int = max(self.k_min, k_max)
+
+    @property
+    def k_interval(self) -> int:
+        """Return interval at which to search k space."""
+        return self.__k_interval
+
+    @k_interval.setter
+    def k_interval(self, k_interval: int) -> None:
+        """Set interval at which to search k space."""
+        if k_interval is None:
+            k_interval = self.DEF_K_INTERVAL
+        self.__k_interval: int = k_interval
+
+    @property
+    def k_values(self) -> List[int]:
+        """Return list of values of k to be searched."""
+        return self.__k_values
+
+    @k_values.setter
+    def k_values(self, k_values: List[int]) -> None:
+        """Set the values of k to be searched."""
+        if k_values is None:
+            k_values = self.__compose_k_values()
+        self.__k_values: List[int] = k_values
+
+    def __compose_k_values(self) -> List[int]:
+        """Make a list of values of k to be searched from min, max and interval."""
+        return list(range(self.k_min, self.k_max+1, self.k_interval))
 
     @property
     def solver(self) -> str:
@@ -328,14 +363,14 @@ class NMFConsensusSelection(NMFModelSelection):
         """
         i: int
         multiproc_args: List[int] = []
-        for i in range(self.k_min, self.k_max + 1):
+        for i in self.k_values:
             multiproc_args += [i] * self.iterations
         with multiprocessing.Pool(processes) as pool:
             models: List[NMF] = pool.map(self._run_for_k_single, multiproc_args)
             pool.close()
         results: List[Tuple[NMFModelSelectionResults, NMFModelSelectionResults]] = []
         print(f'[{time.strftime("%X")}] ITERATIONS COMPLETE, AGGREGATING RESULTS')
-        for i in range(self.k_min, self.k_max + 1):
+        for i in self.k_values:
             print(f'[{time.strftime("%X")}] AGGREGATE {i}')
             kmodels: List[NMF] = [x for x in models if x.n_components == i]
             kresults: Tuple[NMFModelSelectionResults, NMFModelSelectionResults] = self._results_for_k(i, kmodels)
@@ -446,14 +481,14 @@ class NMFJiangSelection(NMFModelSelection):
         """
         i: int
         multiproc_args: List[int] = []
-        for i in range(self.k_min, self.k_max + 1):
+        for i in self.k_values:
             multiproc_args += [i] * self.iterations
         with multiprocessing.Pool(processes) as pool:
             models: List[NMF] = pool.map(self._run_for_k_single, multiproc_args)
             pool.close()
         results: List[NMFModelSelectionResults] = []
         print(f'[{time.strftime("%X")}] ITERATIONS COMPLETE, AGGREGATING RESULTS')
-        for i in range(self.k_min, self.k_max + 1):
+        for i in self.k_values:
             print(f'[{time.strftime("%X")}] AGGREGATE {i}')
             kmodels: List[NMF] = [x for x in models if x.n_components == i]
             kresults: NMFModelSelectionResults = self._results_for_k(i, kmodels)
@@ -561,7 +596,7 @@ class NMFSplitHalfSelection(NMFModelSelection):
 
         i: int
         multiproc_args: List[int] = []
-        for i in range(self.k_min, self.k_max + 1):
+        for i in self.k_values:
             multiproc_args += [i] * self.iterations
         with multiprocessing.Pool(processes) as pool:
             models: List[Tuple[Tuple[NMF, pd.DataFrame], Tuple[NMF, pd.DataFrame]]] = \
@@ -569,7 +604,7 @@ class NMFSplitHalfSelection(NMFModelSelection):
             pool.close()
         results: List[NMFModelSelectionResults] = []
         print(f'[{time.strftime("%X")}] ITERATIONS COMPLETE, AGGREGATING RESULTS')
-        for i in range(self.k_min, self.k_max + 1):
+        for i in self.k_values:
             print(f'[{time.strftime("%X")}] AGGREGATE {i}')
             kmodels: List[Tuple[Tuple[NMF, pd.DataFrame], Tuple[NMF, pd.DataFrame]]] \
                 = [x for x in models if x[0][0].n_components == i]
@@ -643,7 +678,7 @@ class NMFPermutationSelection(NMFModelSelection):
             pool.close()
         resultobjs: List[NMFModelSelectionResults] = []
         print(f'[{time.strftime("%X")}] ITERATIONS COMPLETE, AGGREGATING RESULTS')
-        for i in range(self.k_min, self.k_max + 1):
+        for i in self.k_values:
             print(f'[{time.strftime("%X")}] AGGREGATE {i}')
             # Select the models for which i was selected as optimal k
             kmodels: List[Tuple[NMF, int]] = [x for x in results if x[0].n_components == i]
@@ -673,7 +708,7 @@ class NMFPermutationSelection(NMFModelSelection):
         for col in shuffled.columns:
             shuffled[col] = np.random.permutation(shuffled[col])
         recon_errs: List[Tuple[float, float]] = []
-        for k in range(self.k_min, self.k_max + 1):
+        for k in self.k_values:
             # Run NMF as usual on both shuffled and permuted data
             reg_model: NMF = self._run_for_k_single(k, self.data)
             shuf_model: NMF = self._run_for_k_single(k, shuffled)
@@ -688,7 +723,7 @@ class NMFPermutationSelection(NMFModelSelection):
             if len(recon_errs) > 1:
                 prev_r, prev_s = recon_errs[-2]
                 delta_r, delta_s = curr_r - prev_r, curr_s - prev_s
-                if delta_r > delta_s or k == self.k_max:
+                if delta_r > delta_s or k == self.k_values[-1]:
                     # Return the model for value of k preceding this one, as increasing k here suggested no additional
                     # information to extract
                     return prev_rmodel, k - 1
@@ -761,14 +796,14 @@ class NMFImputationSelection(NMFModelSelection):
         """Run imputation based model selection. Return either the request metric, or a tuple of mse and mad."""
         i: int
         multiproc_args: List[int] = []
-        for i in range(self.k_min, self.k_max + 1):
+        for i in self.k_values:
             multiproc_args += [i] * self.iterations
         with multiprocessing.Pool(processes) as pool:
             models: List[Tuple[wNMF, float]] = pool.map(self._run_for_k_single, multiproc_args)
             pool.close()
         results: List[Tuple[NMFModelSelectionResults, NMFModelSelectionResults]] = []
         print(f'[{time.strftime("%X")}] ITERATIONS COMPLETE, AGGREGATING RESULTS')
-        for i in range(self.k_min, self.k_max + 1):
+        for i in self.k_values:
             print(f'[{time.strftime("%X")}] AGGREGATE {i}')
             k_models: List[Tuple[wNMF, float]] = [x for x in models if x[0].n_components == i]
             k_results: Tuple[NMFModelSelectionResults, NMFModelSelectionResults] = self._results_for_k(i, k_models)
@@ -855,12 +890,12 @@ class NMFMultiSelect:
         'coph', 'disp', 'jiang', 'perm', 'split', 'mse', 'mad'
     ]
 
-    def __init__(self, ranks: Tuple[int, int], methods: List[str] = None, iterations: int = None,
+    def __init__(self, ranks: List[int], methods: List[str] = None, iterations: int = None,
                  nmf_max_iter: int = None, solver: str=None, beta_loss: str=None) -> None:
         """Initialise model selection using one or more of the available methods.
 
-        :param ranks: value of k to start and end search at
-        :type ranks: (int, int)
+        :param ranks: values of k to search
+        :type ranks: List[int]
         :param methods: list of model selection methods to apply
         :type methods: str
         :param iterations: number of iterations to run for each value of k, for each method
@@ -880,15 +915,12 @@ class NMFMultiSelect:
         self.beta_loss = beta_loss
 
     @property
-    def ranks(self) -> Tuple[int, int]:
+    def ranks(self) -> List[int, int]:
         return self.__ranks
 
     @ranks.setter
-    def ranks(self, ranks: Tuple[int, int]) -> None:
-        min_rank, max_rank = ranks
-        if max_rank < min_rank:
-            raise Exception(f'Ranks should be (min,max), must be max >= min. Got min: {min_rank}, max: {max_rank}')
-        self.__ranks: Tuple[int, int] = ranks
+    def ranks(self, ranks: List[int, int]) -> None:
+        self.__ranks: List[int, int] = ranks
 
     @property
     def iterations(self) -> int:
@@ -949,7 +981,7 @@ class NMFMultiSelect:
         res: Dict[str, NMFResults] = {}
 
         if 'coph' in self.methods or 'disp' in self.methods:
-            sel_coph: NMFModelSelection = NMFConsensusSelection(data, self.ranks[0], self.ranks[1], solver=self.solver,
+            sel_coph: NMFModelSelection = NMFConsensusSelection(data, k_values=self.ranks, solver=self.solver,
                                                                 beta_loss=self.beta_loss, iterations=self.iterations,
                                                                 nmf_max_iter=self.nmf_max_iter)
             coph, disp = sel_coph.run(processes)
@@ -957,14 +989,14 @@ class NMFMultiSelect:
             res['disp'] = disp
 
         if 'jiang' in self.methods:
-            sel_jiang: NMFModelSelection = NMFJiangSelection(data, self.ranks[0], self.ranks[1], solver=self.solver,
+            sel_jiang: NMFModelSelection = NMFJiangSelection(data, k_values=self.ranks, solver=self.solver,
                                                              beta_loss=self.beta_loss, iterations=self.iterations,
                                                              nmf_max_iter=self.nmf_max_iter)
             jiang = sel_jiang.run(processes)
             res['jiang'] = jiang
 
         if 'perm' in self.methods:
-            sel_perm: NMFModelSelection = NMFPermutationSelection(data, self.ranks[0], self.ranks[1],
+            sel_perm: NMFModelSelection = NMFPermutationSelection(data, k_values=self.ranks,
                                                                   solver=self.solver,
                                                                   beta_loss=self.beta_loss, iterations=self.iterations,
                                                                   nmf_max_iter=self.nmf_max_iter)
@@ -972,7 +1004,7 @@ class NMFMultiSelect:
             res['perm'] = perm
 
         if 'split' in self.methods:
-            sel_split: NMFModelSelection = NMFSplitHalfSelection(data, self.ranks[0], self.ranks[1],
+            sel_split: NMFModelSelection = NMFSplitHalfSelection(data, k_values=self.ranks,
                                                                  solver=self.solver,
                                                                  beta_loss=self.beta_loss, iterations=self.iterations,
                                                                  nmf_max_iter=self.nmf_max_iter)
@@ -980,7 +1012,7 @@ class NMFMultiSelect:
             res['split'] = split
 
         if 'mse' in self.methods or 'mad' in self.methods:
-            sel_impute: NMFModelSelection = NMFImputationSelection(data, self.ranks[0], self.ranks[1],
+            sel_impute: NMFModelSelection = NMFImputationSelection(data, k_values=self.ranks,
                                                                    solver=self.solver,
                                                                    beta_loss=self.beta_loss, iterations=self.iterations,
                                                                    nmf_max_iter=self.nmf_max_iter,
@@ -1420,11 +1452,14 @@ def tests() -> None:
     # select: NMFModelSelection = (NMFSplitHalfSelection(
     #     df.T, k_min=5, k_max=7, solver='mu', beta_loss='frobenius', iterations=10, nmf_max_iter=10000, metric='ari'
     # ))
-    select = NMFMultiSelect(ranks=(2, 10), beta_loss='kullback-leibler', iterations=15, nmf_max_iter=10000,
+    select = NMFMultiSelect(ranks=list(range(2, 10, 2)), beta_loss='kullback-leibler', iterations=15, nmf_max_iter=10000,
                         solver='mu', methods=['disp', 'coph', 'jiang', 'split', 'perm'])
     results = select.run(df.T)
-    print(results.selected.k)
-    print(results.cophenetic_correlation().T)
+    print(results['coph'].selected.k)
+    print(results['coph'].cophenetic_correlation().T)
+
+    from mg_nmf.nmf import visualise
+    visualise.multiselect_plot(results).show()
     # results.write_results('data/sample.results')
 
 
@@ -1440,5 +1475,5 @@ def leukemia():
         pickle.dump(results, f)
 
 if __name__ == "__main__":
-    # tests()
-    leukemia()
+    tests()
+    # leukemia()
