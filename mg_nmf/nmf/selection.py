@@ -915,12 +915,12 @@ class NMFMultiSelect:
         self.beta_loss = beta_loss
 
     @property
-    def ranks(self) -> List[int, int]:
+    def ranks(self) -> List[int]:
         return self.__ranks
 
     @ranks.setter
-    def ranks(self, ranks: List[int, int]) -> None:
-        self.__ranks: List[int, int] = ranks
+    def ranks(self, ranks: List[int]) -> None:
+        self.__ranks: List[int] = ranks
 
     @property
     def iterations(self) -> int:
