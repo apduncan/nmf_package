@@ -8,6 +8,14 @@ import numpy as np
 import pandas as pd
 from typing import Tuple, Callable, Optional, List, Union, Any
 
+def _unique_index(df: pd.DataFrame, col: bool = True, row: bool = True) -> pd.DataFrame:
+    """Make index and column names unique by prefix an ascending numbering."""
+    if row:
+        df.index = [f'{i}: {df.index[i]}' for i in range(df.shape[0])]
+    if col:
+        df.columns = [f'{i}: {df.columns[i]}' for i in range(df.shape[1])]
+    return df
+
 def sparse_overlap(size: Tuple[int, int], rank: int, n_overlap: float = 0.0, m_overlap: float = 0.0,
                    p_ubiq: float = 0.0, noise: Optional[Tuple[float, float]] = (0, 1),
                    w_fill: Callable[[int, int], np.ndarray] = np.random.rand,
@@ -60,7 +68,7 @@ def sparse_overlap(size: Tuple[int, int], rank: int, n_overlap: float = 0.0, m_o
         mean, sd = noise
         X = _apply_normal_noise(X, mean, sd)
 
-    return X, W, H
+    return _unique_index(X), _unique_index(W, cols=False), _unique_index(H, rows=False)
 
 def _create_overlap(size: Tuple[int, int], overlap: float, fill: Callable[[int], np.ndarray]):
     """Create a matrix of size m x n, with a number of diagonal blocks where a proportion of them overlap.
@@ -94,7 +102,7 @@ def _create_overlap(size: Tuple[int, int], overlap: float, fill: Callable[[int],
 
     c_labels = [f'c{x}' for x in range(m)]
 
-    return pd.DataFrame(matrix, columns=n_labels, index=c_labels)
+    return _unique_index(pd.DataFrame(matrix, columns=n_labels, index=c_labels))
 
 def _apply_normal_noise(matrix: np.ndarray, mu: float, sigma: float, scale_coeff: np.ndarray) -> np.ndarray:
     """Apply normally distributed noise to a matrix.
@@ -210,7 +218,7 @@ def sparse_overlap_even(size: Tuple[int, int], rank: int, n_overlap: float = 0.0
         matrix = _apply_normal_noise(matrix, mean, sd, scale_coeff)
 
     # Convert to labelled DataFrame
-    return pd.DataFrame(matrix, index=m_labels, columns=n_labels)
+    return _unique_index(pd.DataFrame(matrix, index=m_labels, columns=n_labels))
 
 def multipathway(size: Tuple[int, int], rank: int, noise: Optional[Tuple[float, float]], m_prob: List[float],
                  n_prob: List[float], feature_scale: Union[bool, Callable[[], np.array]] = True) -> pd.DataFrame:
@@ -265,7 +273,7 @@ def multipathway(size: Tuple[int, int], rank: int, noise: Optional[Tuple[float, 
     tbl: pd.DataFrame = pd.DataFrame(vals)
     tbl.index = m_idx
     tbl.columns = n_idx
-    return tbl
+    return _unique_index(tbl)
 
 def dense(size: Tuple[int, int], rank: int, noise: Optional[Tuple[float, float]] = (0, 1),
           fill: Callable[[int, int], np.ndarray] = np.random.rand) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -291,7 +299,7 @@ def dense(size: Tuple[int, int], rank: int, noise: Optional[Tuple[float, float]]
     if noise is not None:
         mu, sigma = noise
         X = _apply_normal_noise(X, mu, sigma)
-    return X, W, H
+    return _unique_index(X), _unique_index(W, cols=False), _unique_index(H, rows=False)
 
 if __name__ == "__main__":
     # Some testing

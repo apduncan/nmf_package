@@ -82,8 +82,14 @@ def heatmap_plot(result: selection.NMFModelSelectionResults, w_dot_h: bool = Fal
     h = result.h.copy()
     w = result.w.copy()
     data = result.data.copy()
+
     if flip:
         h, w, data = w.T, h.T, data.T
+
+    if log:
+        w = np.log1p(w)
+        h = np.log1p(h)
+
     h_idx = list(range(len(h.columns)))
     w_idx = list(range(len(w)))
     if ordering == 'affinity':
@@ -101,6 +107,10 @@ def heatmap_plot(result: selection.NMFModelSelectionResults, w_dot_h: bool = Fal
         ordered = w.dot(h)
     else:
         ordered = data.iloc[w_idx, h_idx]
+
+    if log:
+        ordered = np.log1p(ordered)
+
     # Set up the axes with gridspec
     fig = plt.figure(figsize=figsize, dpi=dpi)
     grid = plt.GridSpec(4, 4, hspace=0.2, wspace=0.2)
@@ -108,24 +118,10 @@ def heatmap_plot(result: selection.NMFModelSelectionResults, w_dot_h: bool = Fal
     y_hist = fig.add_subplot(grid[:-1, 0])
     x_hist = fig.add_subplot(grid[-1, 1:])
 
-    if log:
-        # Replace 0 with NaN to allow
-        w = w.replace(0, np.nan)
-        h = h.replace(0, np.nan)
-        ordered = ordered.replace(0, np.nan)
-        sns.heatmap(ordered, ax=main_ax, cbar=cbar, yticklabels=False, xticklabels=False,
-                    norm=LogNorm(vmin=ordered.values.min(), vmax=ordered.values.max()),
-                   mask=ordered.isnull())
-        sns.heatmap(h, ax=x_hist, cbar=cbar,
-                    norm=LogNorm(vmin=h.values.min(), vmax=h.values.max()),
-                   mask=h.isnull())
-        sns.heatmap(w, ax=y_hist, cbar=cbar, yticklabels=1 if len(w) < 100 else 'auto',
-                   norm=LogNorm(vmin=w.values.min(), vmax=w.values.max()),
-                   mask=w.isnull())
-    else:
-        sns.heatmap(ordered, ax=main_ax, cbar=cbar, yticklabels=False, xticklabels=False)
-        sns.heatmap(h, ax=x_hist, cbar=cbar)
-        sns.heatmap(w, ax=y_hist, cbar=cbar, yticklabels=1 if len(w) < 100 else 'auto')
+    sns.heatmap(ordered, ax=main_ax, cbar=cbar, yticklabels=False, xticklabels=False)
+    sns.heatmap(h, ax=x_hist, cbar=cbar)
+    sns.heatmap(w, ax=y_hist, cbar=cbar, yticklabels=1 if len(w) < 100 else 'auto')
+
     if file is not None:
         plt.savefig(file)
     else:
@@ -419,7 +415,7 @@ if __name__ == '__main__':
         rank=3, noise=(0, 2), size=(500, 20), p_ubiq=0.0, m_overlap=0.0, n_overlap=0.0)
     )
     # Apply standard NMF
-    selector = selection.NMFConsensusSelection(rnd_data, k_min=2, k_max=4, solver='mu', beta_loss='kullback-leibler',
+    selector = selection.NMFConsensusSelection(rnd_data, k_min=3, k_max=4, solver='mu', beta_loss='kullback-leibler',
                                             iterations=10, nmf_max_iter=10000)
     results: selection.NMFResults = selector.run()
 
@@ -432,8 +428,8 @@ if __name__ == '__main__':
     print(w_order)
 
     print('TEST HMAP')
-    heatmap_plot(model_3, flip=False, axes=[])
-
+    heatmap_plot(model_3, flip=False, axes=[0,1])
+    f = 'b'
     # print('TARA DATA')
     # t_data = pd.read_csv('data/last_tara_run_data.csv', index_col=0)
     # import normalise as norm
