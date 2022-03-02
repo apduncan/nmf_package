@@ -365,8 +365,9 @@ class NMFConsensusSelection(NMFModelSelection):
         multiproc_args: List[int] = []
         for i in self.k_values:
             multiproc_args += [i] * self.iterations
+        # Try without multiprocessing
         with multiprocessing.Pool(processes) as pool:
-            models: List[NMF] = pool.map(self._run_for_k_single, multiproc_args)
+            models: List[NMF] = map(self._run_for_k_single, multiproc_args)
             pool.close()
         results: List[Tuple[NMFModelSelectionResults, NMFModelSelectionResults]] = []
         print(f'[{time.strftime("%X")}] ITERATIONS COMPLETE, AGGREGATING RESULTS')
@@ -415,16 +416,18 @@ class NMFConsensusSelection(NMFModelSelection):
         :return: model selection results using cophenetic correlation, and dispersion
         :rtype: (NMFSelectionResults, NMFSelectionResults)
         """
-
         i: int
         c_matrices: List[ConnectivityMatrix]
         # Find best model, normalise if required
         best_model: NMF = min(models, key=lambda x: x.reconstruction_err_)
         model_args: List[Tuple[NMF, NMFConsensusSelection]] = [(x, self) for x in models]
+        tfrom = time.time()
         with multiprocessing.Pool() as pool:
-            c_matrices = pool.map(self._create_connectivity_matrix, model_args)
+            c_matrices = list(map(self._create_connectivity_matrix, model_args))
             pool.close()
-        c_bar: pd.DataFrame = ConnectivityMatrix.c_bar(c_matrices) / len(c_matrices)
+        c_bar: pd.DataFrame = ConnectivityMatrix.c_bar(c_matrices)
+        print("Make c_bar", time.time() - tfrom)
+        tfrom = time.time()
         # Find cophenetic correlation value
         c, co_distt = ConnectivityMatrix.cophenetic_corr(c_bar)
         # Find dispersion
@@ -453,6 +456,7 @@ class NMFConsensusSelection(NMFModelSelection):
         h_res: pd.DataFrame = pd.DataFrame(data=h, index=components,
                                            columns=self.data.columns)
         h_res.index.name = 'component'
+        print("End processing", time.time() - tfrom)
         return (
             NMFModelSelectionResults(k, c, c_bar, w_res, h_res, best_model, self.data),
             NMFModelSelectionResults(k, dispersion, c_bar, w_res, h_res, best_model, self.data)
@@ -1091,6 +1095,7 @@ class NMFResults:
         arr: np.array = np.array([['k'] + ks, ['cophenetic_correlation'] + c])
         data: pd.DataFrame = pd.DataFrame(data=arr[:, 1:], index=arr[:, 0:1])
         # Ensure using float as datatype for the criteria values
+        # TEMP TIMING
         for col in data.columns:
             data[col] = data[col].astype('float')
         if plot is not None:
@@ -1354,8 +1359,13 @@ class ConnectivityMatrix:
         :type: pd.DataFrame
         """
         class_df: pd.DataFrame = pd.DataFrame(self.classes.values(), index=self.classes.keys())
-        mat: pd.DataFrame = class_df.T.corr(lambda x, y: int(x[0] == y[0]))
-        return mat
+        # Perform a boolean matrix multiplication for each component, and sum them
+        bmat: np.ndarray = None
+        for label in self.labels:
+            bclass: pd.DataFrame = class_df == label
+            res: np.ndarray = bclass.T.values * bclass.values
+            bmat = res if bmat is None else bmat + res
+        return pd.DataFrame(bmat.astype('int8'), index=class_df.index, columns=class_df.index)
 
     def heatmap(self, output=None) -> None:
         """Display heatmap of this connectivity matrix."""
@@ -1373,7 +1383,7 @@ class ConnectivityMatrix:
         """
         sum_df: pd.DataFrame = reduce(lambda x, y: x.add(y, fill_value=0),
                                       [c.matrix for c in c_matrices])
-        return sum_df
+        return sum_df / len(c_matrices)
 
     @classmethod
     def cophenetic_corr(cls, c_bar: pd.DataFrame, linkage: str = 'complete') -> float:
@@ -1442,8 +1452,8 @@ def tests() -> None:
     """Lazy function to do some testing along the way."""
     # Simulate a large dataset
     N_METAGENES: int = 6
-    N_GENES: int = 400
-    N_SAMPLES: int = 150
+    N_GENES: int = 8000
+    N_SAMPLES: int = 25
     P_OVERLAP: float = 0.0
     NOISE: Tuple[float, float] = (0, 1)
     df: pd.DataFrame = synthdata.sparse_overlap_even(rank=N_METAGENES, m_overlap=P_OVERLAP, n_overlap=P_OVERLAP,
@@ -1452,11 +1462,11 @@ def tests() -> None:
     # select: NMFModelSelection = (NMFSplitHalfSelection(
     #     df.T, k_min=5, k_max=7, solver='mu', beta_loss='frobenius', iterations=10, nmf_max_iter=10000, metric='ari'
     # ))
-    select = NMFMultiSelect(ranks=list(range(2, 10, 2)), beta_loss='kullback-leibler', iterations=15, nmf_max_iter=10000,
-                        solver='mu', methods=['disp', 'coph', 'jiang', 'split', 'perm'])
-    results = select.run(df.T)
-    print(results['coph'].selected.k)
-    print(results['coph'].cophenetic_correlation().T)
+    select = NMFMultiSelect(ranks=list(range(2, 10, 1)), beta_loss='kullback-leibler', iterations=100, nmf_max_iter=10000,
+                        solver='mu', methods=['jiang'])
+    results = select.run(df)
+    print(results['jiang'].selected.k)
+    print(results['jiang'].cophenetic_correlation().T)
 
     from mg_nmf.nmf import visualise
     visualise.multiselect_plot(results).show()
@@ -1475,5 +1485,6 @@ def leukemia():
         pickle.dump(results, f)
 
 if __name__ == "__main__":
-    tests()
+    import cProfile
+    cProfile.run("tests()", "selection.prof")
     # leukemia()
