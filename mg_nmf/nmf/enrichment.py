@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import math
 import tempfile
-from typing import List, Any, Set, Dict, Optional, TextIO, Union, Tuple
+from typing import List, Any, Set, Dict, Optional, TextIO, Union, Tuple, Callable, Collection, Iterable
 
 # Third party module imports
+from Bio.KEGG.REST import *
 import gseapy
 from gseapy import gseaplot
 from gseapy.gsea import Prerank
@@ -21,6 +22,8 @@ from plotly.subplots import make_subplots
 import requests
 
 # Local imports
+from tqdm import tqdm
+
 from mg_nmf.nmf import selection
 from mg_nmf.nmf import signature
 
@@ -248,8 +251,9 @@ class NMFGeneSetEnrichment:
         comp_df: List[pd.DataFrame] = []
         for component, result in self.__results.items():
             df: pd.DataFrame = result.res2d[result.res2d['fdr'] <= significance]
-            df.loc[:, 'component'] = component
-            comp_df.append(df)
+            if len(df) > 0:
+                df.loc[:, 'component'] = component
+                comp_df.append(df)
         # Stack the data from each component
         merged: pd.DataFrame = pd.concat(comp_df, axis=0)
         # Add on the gene set metadata
@@ -287,7 +291,8 @@ class NMFGeneSetEnrichment:
         md_df: pd.DataFrame = pd.DataFrame(items, index=index)
         return data.join(md_df, how='left')
 
-    def plot_enrichment(self, data: pd.DataFrame, group: str = None, label: str = None, width: int = 800, height: int = 1000,
+    def plot_enrichment(self, data: pd.DataFrame, group: str = None, label: str = None, width: int = 800,
+                        height: int = 1000,
                         l_margin: int = 500) -> go.Figure:
         """Generate a plot of enriched / depleted terms, from the output an NMFGeneSetEnrichment.results() call.
 
@@ -457,6 +462,7 @@ class GeneSets(object):
     PFAM2GO_LOCAL: str = 'pfam2go'
     PFAM_ID2GO_LOCAL: str = 'pfam_id2go'
     GO_OBO_LOCAL: str = 'go-basic.obo'
+    KO2PATHWAY_LOCAL: str = 'ko2pathway'
 
     # This constructor implements the Singleton pattern
     def __new__(cls) -> GeneSets:
@@ -695,12 +701,133 @@ class GeneSets(object):
                 pfam = pfam.replace('PF', 'pfam')
                 name = ' '.join(split[1:])
                 name = name.split('>')[0]
-                data.append((pfam , name))
+                data.append((pfam, name))
         df = pd.DataFrame(data, columns=['pfam', 'name'])
         df = df.set_index('pfam')
         df = df.drop_duplicates()
 
         return dict(zip(df.index, df['name']))
+
+    def _kegg_cache_fetch(self, file: str) -> Optional[TextIO]:
+        """Fetch a KEGG API responses from local cache if available, otherwise return None."""
+        local: str = self._local_file(file)
+        if not os.path.exists(local):
+            return None
+        if os.path.getsize(local) <= 0:
+            return None
+        return open(local, 'rt')
+
+    def _kegg_cache_put(self, file: str, content: TextIO) -> None:
+        """Write to a local cache file"""
+        local: str = self._local_file(file)
+        with open(local, 'wt') as f:
+            f.writelines(content.readlines())
+
+    def _kegg_list_resp(self, database: str, org: Optional[str]) -> TextIO:
+        """Fetch a list of what is contained in a given KEGG database."""
+        cache_local: str = f'kegg_list_{database}' + '' if org is None else f'_{org}'
+        # Attempt to load from cache first
+        resp: TextIO = self._kegg_cache_fetch(cache_local)
+        if resp is None:
+            # Fetch from API
+            resp: TextIO = kegg_list(database) if org is None else kegg_list(database, org)
+            # Write, then load (clumsy but ensures file and pointer in right place)
+            self._kegg_cache_put(cache_local, resp)
+            resp = self._kegg_cache_fetch(cache_local)
+        return resp
+
+    def _kegg_list(self, database: str, org: Optional[str]) -> Collection[str]:
+        with self._kegg_list_resp(database, org) as f:
+            pathway_list: List[str] = [x.split('\t')[0].split(':')[1] for x in f.readlines()]
+        return pathway_list
+
+    def _kegg_link_resp(self, target: str, source: str) -> TextIO:
+        """Fetch a list of items which are linked to a given entry."""
+        cache_local: str = f'kegg_link_{target}_{source}'
+        # Attempt to load from cache first
+        resp: TextIO = self._kegg_cache_fetch(cache_local)
+        if resp is None:
+            # Fetch from API
+            resp: TextIO = kegg_link(target, source)
+            # Write, then load (clumsy but ensures file and pointer in right place)
+            self._kegg_cache_put(cache_local, resp)
+            resp = self._kegg_cache_fetch(cache_local)
+        return resp
+
+    def _kegg_link(self, target: str, source: str) -> Collection[str]:
+        """Fetch a list of items which are linked to a given entry."""
+        def line_to_id(line: str) -> Optional[str]:
+            cols: List[str] = line.strip().split('\t')
+            if len(cols) < 2:
+                return None
+            item: List[str] = cols[1].split(':')
+            if len(cols) < 2:
+                return None
+            return item[1]
+        with self._kegg_link_resp(target, source) as f:
+            item_list: List[str] = [line_to_id(x) for x in f.readlines()]
+        item_list = [x for x in item_list if x is not None]
+        return item_list
+
+    def geneset_ko2pathway(self, limit_pathways: Union[Callable[[str], bool], Collection] = lambda name: True,
+                           org: Optional[str] = None) -> Dict[str, Set[str]]:
+        """Mapping of KEGG pathways to the KEGG Ortholog terms within that pathway. Can select a subset of all
+        pathways.
+
+        :param limit_pathways:  Select which pathways to consider. Either a list of identifiers, or a method which 
+                                can be passed a pathway identifier and return a boolean indicating whether to include.
+        :type limit_pathways:   Union[Callable[[str], bool], Collection]
+        :param org: Organism to list pathways within. Maybe useful if not looking at metagenomics
+        :type org: Optional[str]
+        :return: Dictionary with key being KEGG Pathway and value the KO term which map to that pathway.
+        :rtype: Dict[str, Set[str]]
+        """
+        # We need to interact with the KEGG API to get details, as we'll assume users (like me) don't have access to
+        # the KEGG database / FTP
+        # Retrieve a list of all pathways in the databse & organism
+        pathway_list: Collection[str] = self._kegg_list('pathway', org)
+        # Restrict based on list or predicate
+        if isinstance(limit_pathways, Iterable):
+            pathway_list = set(pathway_list).intersection(set(limit_pathways))
+        if isinstance(limit_pathways, Callable):
+            pathway_list = list(filter(limit_pathways, pathway_list))
+        # For each pathway, retrieve KEGG Ortholog terms which are in the pathways
+        pathway_dict: Dict[str, Set[str]] = {}
+        for pathway in tqdm(pathway_list, desc='Fetch KEGG pathways'):
+            pathway_dict[pathway] = set(self._kegg_link('ko', pathway))
+        return pathway_dict
+
+    def geneset_metadata_kegg_pathways(self, org: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+        """Metadata for KEGG pathways (just provides name currently)
+
+        :param org: Organism to list pathways within. Maybe useful if not looking at metagenomics
+        :type org: Optional[str]
+        :return: Dictionary with key being KEGG Pathway and value the KO term which map to that pathway.
+        :rtype: Dict[str, Set[str]]
+        """
+        kegg_resp: TextIO = self._kegg_list_resp('pathway', org)
+        kegg_md: Dict[str, Dict[str, Any]] = {}
+        for line in (x.strip() for x in kegg_resp.readlines()):
+            cols: List[str] = line.split('\t')
+            pathway: str = cols[0].split(':')[1]
+            name: str = cols[1]
+            kegg_md[pathway] = dict(name=name)
+        return kegg_md
+
+    def geneid_names_ko(self) -> Dict[str, str]:
+        """Names for each KO term (full name, includes EC number where given)
+
+        :return: Dicionary where key is KO term, value is name
+        :rtype: Dict[str, str] 
+        """
+        resp: TextIO = self._kegg_list_resp('ko', None)
+        resp_dict: Dict[str, str] = {}
+        for line in (x.strip() for x in resp.readlines()):
+            cols: List[str] = line.split('\t')
+            ko: str = cols[0].split(':')[1]
+            name: str = cols[1]
+            resp_dict[ko] = name
+        return resp_dict
 
     @classmethod
     def geneset_size_bounds(self, geneset: Dict[str, Set[str]]) -> Tuple[int, int]:
@@ -713,23 +840,33 @@ class GeneSets(object):
         size_list: List[int] = [len(y) for x, y in geneset.items()]
         return min(size_list), max(size_list)
 
+
 if __name__ == '__main__':
     from pickle import dump, load
     from mg_nmf.nmf.selection import NMFResults, NMFModelSelectionResults
+
     # # Load some premade model results
-    MODEL_RES = '/home/hal/nmf/rerun_surf.res'
+    # MODEL_RES = '/home/hal/nmf/rerun_surf.res'
+    MODEL_RES = '/media/hal/safe_hal/work/nmf_otherenv/sediment/error_model.pickle'
     # res = selection.NMFModelSelectionResults.load_model(MODEL_RES)
     with open(MODEL_RES, 'rb') as f:
         res = load(f)
-        res = res['coph'].selected
+        # res = res['coph'].selected
+    # Load a custom genset
+    with open('/media/hal/safe_hal/work/nmf_otherenv/sediment/error_geneset.pickle', 'rb') as f:
+        resgenes = load(f)
     # res = res['coph'].selected
     # Make an analysis object
     analysis: NMFGeneSetEnrichment = NMFGeneSetEnrichment(model=res, data=res.data,
-                                                          gene_sets=GeneSets().geneset_ipr2go(),
-                                                          gene_set_metadata=GeneSets().geneset_metadata_go(),
-                                                          gene_names=GeneSets().geneid_names_interpro(),
-                                                          label='go', processes=4, min_size=5,
+                                                          gene_sets=resgenes,
+                                                          processes=4, min_size=5,
                                                           max_size=None)
+    # analysis: NMFGeneSetEnrichment = NMFGeneSetEnrichment(model=res, data=res.data,
+    #                                                       gene_sets=GeneSets().geneset_ko2pathway(),
+    #                                                       gene_set_metadata=GeneSets().geneset_metadata_kegg_pathways(),
+    #                                                       gene_names=GeneSets().geneid_names_ko(),
+    #                                                       label='go', processes=4, min_size=5,
+    #                                                       max_size=None)
     anres = analysis.results(0.05)
     # with open('../tests/data/large_enrichment', 'rb') as f:
     #     analysis: NMFGeneSetEnrichment = load(f)
@@ -739,4 +876,4 @@ if __name__ == '__main__':
     analysis.plot_enrichment(res, group='namespace', label='name').show()
     analysis.plot_geneset_correlation('c1', 'GO:0009055').show()
     analysis.plot_gsea('c1', 'GO:0009055', ofname='t.png')
-    dump(analysis, open('/home/hal/Dropbox/PHD/FunctionalAbundance/nmf/data/metatranscriptome_k6.enrich', 'wb+'))
+    # dump(analysis, open('/home/hal/Dropbox/PHD/FunctionalAbundance/nmf/data/metatranscriptome_k6.enrich', 'wb+'))

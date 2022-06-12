@@ -367,7 +367,7 @@ class NMFConsensusSelection(NMFModelSelection):
             multiproc_args += [i] * self.iterations
         # Try without multiprocessing
         with multiprocessing.Pool(processes) as pool:
-            models: List[NMF] = map(self._run_for_k_single, multiproc_args)
+            models: List[NMF] = list(map(self._run_for_k_single, multiproc_args))
             pool.close()
         results: List[Tuple[NMFModelSelectionResults, NMFModelSelectionResults]] = []
         print(f'[{time.strftime("%X")}] ITERATIONS COMPLETE, AGGREGATING RESULTS')
@@ -740,11 +740,11 @@ class NMFImputationSelection(NMFModelSelection):
     the wNMF package, which is considerably slower than the sklearn NMF implementation."""
     METRICS: List[str] = ['mse', 'mad', 'both']
 
-    def __init__(self, data: pd.DataFrame, k_min: int = None, k_max: int = None,
-                 solver: str = None, beta_loss: str = None, iterations: int = None, nmf_max_iter=None,
-                 normalise: Callable[[pd.DataFrame, float], pd.DataFrame] = None, normalise_arg: float = None,
-                 filter_fn=None,
-                 filter_threshold: float = None, metric: str = 'mse', p_holdout: float = 0.1) -> None:
+    def __init__(self, data: pd.DataFrame, k_min: int = None, k_max: int = None, k_interval: int = None,
+                 k_values: List[int] = None, solver: str = None, beta_loss: str = None, iterations: int = None,
+                 nmf_max_iter=None, normalise: Callable[[pd.DataFrame, float], pd.DataFrame] = None,
+                 normalise_arg: float = None, filter_fn=None, filter_threshold: float = None, metric: str = 'mse',
+                 p_holdout: float = 0.1) -> None:
         """Set up properties for model selection.
 
         :param data: data to learn model from
@@ -776,7 +776,7 @@ class NMFImputationSelection(NMFModelSelection):
         """
         super().__init__(data=data, k_min=k_min, k_max=k_max, solver=solver, beta_loss=beta_loss, iterations=iterations,
                          nmf_max_iter=nmf_max_iter, normalise=normalise, normalise_arg=normalise_arg,
-                         filter_fn=filter_fn,
+                         filter_fn=filter_fn, k_values=k_values,
                          filter_threshold=filter_threshold, metric=metric)
         self.p_holdout = p_holdout
         if filter_fn is not None or normalise is not None:
@@ -1365,7 +1365,7 @@ class ConnectivityMatrix:
             bclass: pd.DataFrame = class_df == label
             res: np.ndarray = bclass.T.values * bclass.values
             bmat = res if bmat is None else bmat + res
-        return pd.DataFrame(bmat.astype('int8'), index=class_df.index, columns=class_df.index)
+        return pd.DataFrame(bmat.astype('uint16'), index=class_df.index, columns=class_df.index)
 
     def heatmap(self, output=None) -> None:
         """Display heatmap of this connectivity matrix."""
@@ -1462,9 +1462,11 @@ def tests() -> None:
     # select: NMFModelSelection = (NMFSplitHalfSelection(
     #     df.T, k_min=5, k_max=7, solver='mu', beta_loss='frobenius', iterations=10, nmf_max_iter=10000, metric='ari'
     # ))
-    select = NMFMultiSelect(ranks=list(range(2, 10, 1)), beta_loss='kullback-leibler', iterations=100, nmf_max_iter=10000,
-                        solver='mu', methods=['jiang'])
-    results = select.run(df)
+    # Load the data we're having errors with
+    data = pd.read_csv('/media/hal/safe_hal/work/nmf_otherenv/sediment/input_dump.csv', index_col=0)
+    select = NMFMultiSelect(ranks=list(range(2, 10, 1)), beta_loss='kullback-leibler', iterations=150, nmf_max_iter=10000,
+                        solver='mu', methods=['coph', 'disp'])
+    results = select.run(data)
     print(results['jiang'].selected.k)
     print(results['jiang'].cophenetic_correlation().T)
 
@@ -1479,12 +1481,13 @@ def leukemia():
     leuk: pd.DataFrame = pd.read_csv('~/nmf/data/surface_data.csv', index_col=0).astype('float64')
     # tara.drop(columns=['description'],inplace=True)
     select = NMFMultiSelect(ranks=(8, 8), beta_loss='kullback-leibler', iterations=10, nmf_max_iter=10000,
-                            solver='mu', methods=['coph', 'disp'])
+                            solver='mu', methods=['mad'])
     results = select.run(leuk)
     with open('/home/hal/nmf/rerun_surf.res', 'wb') as f:
         pickle.dump(results, f)
 
 if __name__ == "__main__":
     import cProfile
-    cProfile.run("tests()", "selection.prof")
+    # cProfile.run("tests()", "selection.prof")
+    tests()
     # leukemia()
