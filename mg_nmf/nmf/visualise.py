@@ -157,6 +157,15 @@ def multiselect_plot(result: selection.NMFMultiSelect, file: str = None, figsize
     for method, results in result.items():
         data = results.cophenetic_correlation()
 
+        # Want to provide a warning if permutation method has any cases where it failed to reach a stopping condition
+        if method == 'perm':
+            sdata = data.sum(axis=1)
+            missing = 1 - sdata.iloc[1]
+            if missing > 0:
+                print('WARNING')
+                print(f'Permutation method failed to reach stopping condition in {missing:.2%} of runs')
+                print('Consider raising value of k searched if failing in high proportion of runs')
+
         fig.append_trace(go.Scatter(
             y=data.iloc[1, :].astype('float64'), x=data.iloc[0, :], mode='lines', line=dict(color=colors[color]), showlegend=False,
             name=method
@@ -412,8 +421,15 @@ def rgb_to_string(df):
 if __name__ == '__main__':
     # Some tests
     rnd_data: pd.DataFrame = selection.shuffle_frame(selection.synthdata.sparse_overlap_even(
-        rank=3, noise=(0, 2), size=(500, 20), p_ubiq=0.0, m_overlap=0.0, n_overlap=0.0)
+        rank=3, noise=(0, 2), size=(500, 100), p_ubiq=0.0, m_overlap=0.0, n_overlap=0.0)
     )
+
+    # Apply multiselect to see if we can get warnings
+    ms = selection.NMFMultiSelect(ranks=list(range(2, 6)), methods=['perm'], iterations=50,
+                                  beta_loss='kullback-leibler', solver='mu')
+    ms_res = ms.run(rnd_data)
+    multiselect_plot(ms_res)
+
     # Apply standard NMF
     selector = selection.NMFConsensusSelection(rnd_data, k_min=3, k_max=4, solver='mu', beta_loss='kullback-leibler',
                                             iterations=10, nmf_max_iter=10000)

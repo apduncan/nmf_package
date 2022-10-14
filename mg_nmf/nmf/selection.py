@@ -9,6 +9,7 @@ import multiprocessing
 import random
 import time
 from typing import List, Tuple, Dict, Callable, Union, Optional, Any
+import warnings
 
 # Dependency imports
 from joblib import dump, load
@@ -238,6 +239,7 @@ class NMFModelSelection(ABC):
     def data(self, data: pd.DataFrame) -> None:
         """Set the data to train on."""
         self.__data = data
+        self._data_warn()
 
     @property
     def normalise(self) -> Callable[[pd.DataFrame, float], pd.DataFrame]:
@@ -295,6 +297,18 @@ class NMFModelSelection(ABC):
     def run(self, processes: int = 1) -> NMFResults:
         """Run process for model selection of NMF."""
         pass
+
+    def _data_warn(self) -> None:
+        """Provide warning if it appears that data may be in incorrect orientation.
+        NMF literature describes X as a matrix with samples on columns, and features on rows. However, sk-learn
+        has this transposed, which is important for fitting new samples. Want to detect if input data is provided in
+        what is likely the wrong orientation. This is detected based on number of samples being larger than number of
+        features; we would generally expect in meta-omic data that number of features >> number samples."""
+        if self.data is not None:
+            rows, cols = self.data.shape
+            if rows > cols:
+                warnings.warn('Data orientation may be incorrect. Input matrix X should have features on columns, ' 
+                              'samples on rows. sk-learn orientation is transposed from majority of NMF literature.')
 
     def _run_for_k_single(self, k: int, data: pd.DataFrame = None) -> NMF:
         """Create models and assess stability for k components.
@@ -522,15 +536,23 @@ class NMFJiangSelection(NMFModelSelection):
         :rtype: NMFModelSelectionResults
         """
 
+        # The paper states that similarity matrix S is calculate from 'sample projection' matrix H
+        # Due to transposition of data in sklearn implementation, our sample matrix is actually W, and sould be
+        # calculated from this instead.
         # Select model with lowest reconstruction error
         best_model: NMF = min(models, key=lambda p: p.reconstruction_err_)
         best_W = best_model.transform(self.data)
         best_H = best_model.components_
         if self.normalise is not None:
             best_W, best_H = norm.normalise(self.normalise(best_W, self.normalise_arg), best_W, best_H)
-        best_H_enorm: np.ndarray = np.linalg.norm(best_H, axis=0)
-        best_H_bar: pd.DataFrame = (best_H.T / best_H_enorm[:, None]).T
-        best_S: pd.DataFrame = best_H_bar.T.dot(best_H_bar)
+        # best_H_enorm: np.ndarray = np.linalg.norm(best_H, axis=0)
+        # best_H_bar: pd.DataFrame = (best_H.T / best_H_enorm[:, None]).T
+        # best_S: pd.DataFrame = best_H_bar.T.dot(best_H_bar)
+        # Reshape to modules on rows, samples on columns
+        bW_reshape: np.ndarray = best_W.T
+        best_W_enorm: np.ndarray = np.linalg.norm(bW_reshape, axis=0)
+        best_W_bar: pd.DataFrame = (bW_reshape / best_W_enorm)
+        best_S: pd.DataFrame = best_W_bar.T.dot(best_W_bar)
         diffs: List[float] = []
         for model in models:
             # Skip if this model is the one which had lowest reconstruction error
@@ -538,20 +560,22 @@ class NMFJiangSelection(NMFModelSelection):
                 continue
             w_model = model.transform(self.data)
             h_model = model.components_
+            # Normalise H
             if self.normalise is not None:
                 w_model, h_model = norm.normalise(self.normalise(w_model, self.normalise_arg), w_model, h_model)
-            # Normalise H
-            h_enorm = np.linalg.norm(h_model, axis=0)
-            h_bar = (h_model.T / h_enorm[:, None]).T
+            # Derive similarity matrix for this iteration
+            w_reshape = w_model.T
+            w_enorm = np.linalg.norm(w_reshape, axis=0)
+            w_bar = (w_reshape / w_enorm)
             # Convert to similarity
-            s: pd.DataFrame = h_bar.T.dot(h_bar)
+            s: pd.DataFrame = w_bar.T.dot(w_bar)
             # Get D - difference between selected model and this
             d: pd.DataFrame = best_S - s
             d_ltri = self._extract_tril(np.square(d))
             diffs += d_ltri
         # Find mean of squared difference between best_S and S_j
-        ci = 1 - np.median(diffs)
-        # ci = 1 - np.mean(diffs)
+        # ci = 1 - np.median(diffs)
+        ci = 1 - np.mean(diffs)
         # Make dataframes out of w and h with lowest error
         components = [f'c{x}' for x in range(1, k + 1)]
         w_model = pd.DataFrame(best_W, index=self.data.index, columns=components)
@@ -682,10 +706,11 @@ class NMFPermutationSelection(NMFModelSelection):
             pool.close()
         resultobjs: List[NMFModelSelectionResults] = []
         print(f'[{time.strftime("%X")}] ITERATIONS COMPLETE, AGGREGATING RESULTS')
+        nonnull_results: List[Tuple[NMF, int]] = [x for x in results if x[0] is not None]
         for i in self.k_values:
             print(f'[{time.strftime("%X")}] AGGREGATE {i}')
             # Select the models for which i was selected as optimal k
-            kmodels: List[Tuple[NMF, int]] = [x for x in results if x[0].n_components == i]
+            kmodels: List[Tuple[NMF, int]] = [x for x in nonnull_results if x[0].n_components == i]
             # Make this into an NMF model selection results  object
             proportion: float = len(kmodels) / len(results) if len(results) > 0 else 0
             # Select the model with best reconstruction error
@@ -695,6 +720,13 @@ class NMFPermutationSelection(NMFModelSelection):
             )
             resultobjs.append(resobj)
         print(f'[{time.strftime("%X")}] AGGREGATION COMPLETE')
+        # Output proportion of runs where no stopping criteria was met
+        null_models: List[Tuple[NMF, int]] = [x for x in results if x[0] is None]
+        null_prop: float = len(null_models) / len(results) if len(results) > 0 else 0
+        print(f'[{time.strftime("%X")}] PERMUTATION STOPPING REPORT')
+        print(f'[{time.strftime("%X")}] Condition not met: {null_prop:.2%}')
+        print(f'[{time.strftime("%X")}] If stopping condition not met in high proportion of runs, ' +
+              f'consider raising value of k search')
         # Process all the different runs for a value of k
         return NMFResults(resultobjs, self.data)
 
@@ -708,9 +740,10 @@ class NMFPermutationSelection(NMFModelSelection):
         :rtype: (NMF, int)
         """
         # First step is to permute each row of the data
-        shuffled: pd.DataFrame = self.data.copy()
+        shuffled: pd.DataFrame = self.data.copy().T
         for col in shuffled.columns:
             shuffled[col] = np.random.permutation(shuffled[col])
+        shuffled = shuffled.T
         recon_errs: List[Tuple[float, float]] = []
         for k in self.k_values:
             # Run NMF as usual on both shuffled and permuted data
@@ -727,10 +760,14 @@ class NMFPermutationSelection(NMFModelSelection):
             if len(recon_errs) > 1:
                 prev_r, prev_s = recon_errs[-2]
                 delta_r, delta_s = curr_r - prev_r, curr_s - prev_s
-                if delta_r > delta_s or k == self.k_values[-1]:
+                if delta_r > delta_s:
                     # Return the model for value of k preceding this one, as increasing k here suggested no additional
                     # information to extract
                     return prev_rmodel, k - 1
+                if k == self.k_values[-1]:
+                    # No stopping condition reached within the specified values of k searched, so wish to return a
+                    # null result
+                    return None, None
             # Save the current model - will want to return them if next k shows levelling of slope
             prev_rmodel: NMF = reg_model
 
@@ -1474,6 +1511,17 @@ def tests() -> None:
     visualise.multiselect_plot(results).show()
     # results.write_results('data/sample.results')
 
+def orientation_tests():
+    # Make some synthetic data to play with
+    data: pd.DataFrame = synthdata.sparse_overlap_even(rank=4, m_overlap=0, n_overlap=0,
+                                                     size=(300, 48), noise=(0,1), p_ubiq=0.1, feature_scale=True)
+    # Transpose to sk-learn orientation
+    data = data.T
+    # sns.heatmap(data)
+    # plt.show()
+    sel: NMFModelSelection = NMFPermutationSelection(data, k_values=[2,6], solver='mu', beta_loss='kullback-leibler',
+                                               iterations=10)
+    res = sel.run()
 
 def leukemia():
     import pickle
@@ -1489,5 +1537,6 @@ def leukemia():
 if __name__ == "__main__":
     import cProfile
     # cProfile.run("tests()", "selection.prof")
-    tests()
+    # tests()
+    orientation_tests()
     # leukemia()

@@ -35,6 +35,7 @@ class NMFGeneSetEnrichment:
     samples, and the weights of each component across samples.
     """
 
+
     def __init__(self, model: selection.NMFModelSelectionResults, data: pd.DataFrame, gene_sets: Dict[str, Set[str]],
                  gene_set_metadata: Dict[str, Dict[str, Any]] = None, gene_names: Dict[str, str] = None,
                  label: str = 'analysis', permutation_num: int = 100, outdir: str = None, processes: int = 1,
@@ -79,6 +80,9 @@ class NMFGeneSetEnrichment:
         self.max_size, self.min_size = max_size, min_size
         self.__correlation: Optional[Dict[str, pd.DataFrame]] = None
         self.__results: Optional[Dict[str, Prerank]] = None
+        self.__nes_col: Optional[str] = None
+        self.__fdr_col: Optional[str] = None
+        self.__index_col: Optional[str] = None
 
     @property
     def model(self) -> selection.NMFModelSelectionResults:
@@ -201,6 +205,42 @@ class NMFGeneSetEnrichment:
             min_size = GeneSets.geneset_size_bounds(self.gene_sets)[0]
         self.__min_size: int = min_size
 
+    @property
+    def fdr_col(self) -> str:
+        """Return the column name in gseapy result dataframe which contains FDR threshold. If this is None when running
+         analysis, will attempt to automatically determine. Field changed name between versions."""
+        return self.__fdr_col
+
+    @fdr_col.setter
+    def fdr_col(self, fdr_col: str) -> None:
+        """Set the column name in gseapy result dataframe which contains FDR threshold. If this is None when running
+        analysis, will attempt to automatically determine. Field changed name between versions."""
+        self.__fdr_col = fdr_col
+
+    @property
+    def nes_col(self) -> str:
+        """Return the column name in gseapy result dataframe which contains normalised enrichment score. If this is None
+         when running analysis, will attempt to automatically determine. Field changed name between versions."""
+        return self.__nes_col
+
+    @nes_col.setter
+    def nes_col(self, nes_col: str) -> None:
+        """Set the column name in gseapy result dataframe which contains normalised enrichment score. If this is None
+        when running analysis, will attempt to automatically determine. Field changed name between versions."""
+        self.__nes_col = nes_col
+
+    @property
+    def index_col(self) -> str:
+        """Return the column name in gseapy result dataframe which contains gene set identifier. If this is None
+         when running analysis, will attempt to automatically determine. Field changed name between versions."""
+        return self.__index_col
+
+    @index_col.setter
+    def index_col(self, index_col: str) -> None:
+        """Set the column name in gseapy result dataframe which contains gene set identifier. If this is None
+        when running analysis, will attempt to automatically determine. Field changed name between versions."""
+        self.__index_col = index_col
+
     def analyse(self, processes: int = None) -> Dict[str, Prerank]:
         """Run GSEA analysis
 
@@ -237,6 +277,33 @@ class NMFGeneSetEnrichment:
         self.__results: Dict[str, Prerank] = prerank_results
         return prerank_results
 
+    def __set_gsea_fields(self, result: Dict[str, gseapy.gsea.Prerank]) -> None:
+        """Determine the names of fields in the GSEA result objects. The titling changed between versions, want to
+        support either output format rather than require a specific version."""
+        # Get a single result object
+        r: gseapy.gsea.Prerank = next(iter(result.values()))
+        r2d: pd.DataFrame = r.res2d
+        cols: List[str] = list(r2d.columns)
+        if self.fdr_col is None:
+            if 'fdr' in cols:
+                self.fdr_col = 'fdr'
+            if 'FDR q-val' in cols:
+                self.fdr_col = 'FDR q-val'
+        if self.nes_col is None:
+            if 'nes' in cols:
+                self.nes_col = 'nes'
+            if 'NES' in cols:
+                self.nes_col = 'NES'
+        if self.index_col is None:
+            if 'index' in cols:
+                self.index_col = 'index'
+            if 'Term' in cols:
+                self.index_col = 'Term'
+        # Error if any still None, instruct user to set as cannot be determined
+        if self.fdr_col is None or self.nes_col is None or self.index_col is None:
+            raise Exception('Unable to determine normalised enrichment score, FDR value, and gene set index column '
+                'names. Set fdr_col, nes_col, and index_col values prior to calling results method.')
+
     def results(self, significance: float = 0.05) -> pd.DataFrame:
         """Return a table of results meeting the specificed significance level.
 
@@ -247,10 +314,12 @@ class NMFGeneSetEnrichment:
         # If analysis hasn't been run, run it now
         if self.__results is None:
             self.__results = self.analyse(processes=self.processes)
+        # Check we have set the column names for the relevant values
+        self.__set_gsea_fields(self.__results)
         # Loop through each component and make a filtered DataFrame
         comp_df: List[pd.DataFrame] = []
         for component, result in self.__results.items():
-            df: pd.DataFrame = result.res2d[result.res2d['fdr'] <= significance]
+            df: pd.DataFrame = result.res2d[result.res2d[self.fdr_col] <= significance]
             if len(df) > 0:
                 df.loc[:, 'component'] = component
                 comp_df.append(df)
@@ -289,7 +358,7 @@ class NMFGeneSetEnrichment:
         # Performed via a join. First make a DataFrame of the metadata
         index, items = list(self.gene_set_metadata.keys()), list(self.gene_set_metadata.values())
         md_df: pd.DataFrame = pd.DataFrame(items, index=index)
-        return data.join(md_df, how='left')
+        return data.join(md_df, how='left', on=self.index_col)
 
     def plot_enrichment(self, data: pd.DataFrame, group: str = None, label: str = None, width: int = 800,
                         height: int = 1000,
@@ -332,19 +401,21 @@ class NMFGeneSetEnrichment:
 
         # Produce a heatmap for each group
         row: int = 1
-        idx_cols = ['index'] if label is None else ['index', label]
+        idx_cols = [self.index_col] if label is None else [self.index_col, label]
         for group_name in groups:
             # Reduce to results only from this group
             df_reduce: pd.DataFrame = df[df[group] == group_name].reset_index()
-            df_piv: pd.DataFrame = df_reduce.pivot(index=idx_cols, columns='component', values='nes')
+            df_piv: pd.DataFrame = df_reduce.pivot(index=idx_cols, columns='component', values=self.nes_col)
+            # Set the nes values to a numeric datatype
+            df_piv = df_piv.astype('float64')
             # Order by component with max enrichment
             df_piv.loc[:, 'max'] = df_piv.idxmax(axis=1)
             df_piv = df_piv.sort_values(by='max')
             df_piv.drop(columns=['max'], inplace=True)
             # Join term name + id
             df_deind: pd.DataFrame = df_piv.reset_index()
-            y_labels: List[str] = df_deind['index'] if label is None else df_deind[label] + ' (' + df_deind[
-                'index'] + ')'
+            y_labels: List[str] = df_deind[self.index_col].astype(str) if label is None else df_deind[label].astype(str) \
+                + ' (' + df_deind[self.index_col].astype(str) + ')'
             # Add to plot
             fig.add_trace(go.Heatmap(
                 z=df_piv.values,
@@ -846,34 +917,34 @@ if __name__ == '__main__':
     from mg_nmf.nmf.selection import NMFResults, NMFModelSelectionResults
 
     # # Load some premade model results
-    # MODEL_RES = '/home/hal/nmf/rerun_surf.res'
-    MODEL_RES = '/media/hal/safe_hal/work/nmf_otherenv/sediment/error_model.pickle'
+    MODEL_RES = '/home/hal/nmf/rerun_surf.res'
+    # MODEL_RES = '/media/hal/safe_hal/work/nmf_otherenv/sediment/error_model.pickle'
     # res = selection.NMFModelSelectionResults.load_model(MODEL_RES)
     with open(MODEL_RES, 'rb') as f:
         res = load(f)
-        # res = res['coph'].selected
+        res = res['coph'].selected
     # Load a custom genset
     with open('/media/hal/safe_hal/work/nmf_otherenv/sediment/error_geneset.pickle', 'rb') as f:
         resgenes = load(f)
     # res = res['coph'].selected
     # Make an analysis object
-    analysis: NMFGeneSetEnrichment = NMFGeneSetEnrichment(model=res, data=res.data,
-                                                          gene_sets=resgenes,
-                                                          processes=4, min_size=5,
-                                                          max_size=None)
     # analysis: NMFGeneSetEnrichment = NMFGeneSetEnrichment(model=res, data=res.data,
-    #                                                       gene_sets=GeneSets().geneset_ko2pathway(),
-    #                                                       gene_set_metadata=GeneSets().geneset_metadata_kegg_pathways(),
-    #                                                       gene_names=GeneSets().geneid_names_ko(),
-    #                                                       label='go', processes=4, min_size=5,
+    #                                                       gene_sets=resgenes,
+    #                                                       processes=4, min_size=5,
     #                                                       max_size=None)
+    analysis: NMFGeneSetEnrichment = NMFGeneSetEnrichment(model=res, data=res.data,
+                                                          gene_sets=GeneSets().geneset_ipr2go(),
+                                                          gene_set_metadata=GeneSets().geneset_metadata_go(),
+                                                          gene_names=GeneSets().geneid_names_interpro(),
+                                                          label='go', processes=4, min_size=5,
+                                                          max_size=None)
     anres = analysis.results(0.05)
     # with open('../tests/data/large_enrichment', 'rb') as f:
     #     analysis: NMFGeneSetEnrichment = load(f)
     pd.set_option('display.max_columns', None)
     res = analysis.results(significance=0.05)
     print(analysis.results(significance=0.05))
-    analysis.plot_enrichment(res, group='namespace', label='name').show()
-    analysis.plot_geneset_correlation('c1', 'GO:0009055').show()
-    analysis.plot_gsea('c1', 'GO:0009055', ofname='t.png')
+    analysis.plot_enrichment(res).show()
+    # analysis.plot_geneset_correlation('c1', 'GO:0009055').show()
+    # analysis.plot_gsea('c1', 'GO:0009055', ofname='t.png')
     # dump(analysis, open('/home/hal/Dropbox/PHD/FunctionalAbundance/nmf/data/metatranscriptome_k6.enrich', 'wb+'))

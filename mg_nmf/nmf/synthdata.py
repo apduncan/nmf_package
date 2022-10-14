@@ -130,7 +130,7 @@ def __defualt_row_scale(size: int) -> float:
 def sparse_overlap_even(size: Tuple[int, int], rank: int, n_overlap: float = 0.0, m_overlap: float = 0.0,
                    p_ubiq: float = 0.0, noise: Optional[Tuple[float, float]] = (0, 1),
                    fill: Callable[[int, int], np.ndarray] = np.random.rand,
-                    feature_scale: Union[bool, Callable[[], np.array]] = True) -> pd.DataFrame:
+                   feature_scale: Union[bool, Callable[[], np.array]] = True) -> pd.DataFrame:
     """
     Create data with a sparse underlying structure. Will have a block diagonal structure, with a portion of features
     and observations overlapping based on m_overlap and n_overlap parameters. Can add some ubiquitous features which
@@ -320,9 +320,10 @@ if __name__ == "__main__":
     #
     # np.random.seed(0)
     # x = sparse_overlap_even(size=(150, 50), rank=8, n_overlap=0.5, m_overlap=0.3, noise=(0, 1), p_ubiq=0.3)
-    x = multipathway(size=(500, 150), rank=5, n_prob=[1/3]*5, m_prob=[1/3]*5, noise=(0, 0))
+    # x = multipathway(size=(500, 150), rank=5, n_prob=[1/3]*5, m_prob=[1/3]*5, noise=(0, 0))
     # np.random.seed(0)
-    # x2 = sparse_overlap_even(size=(150, 50), rank=8, n_overlap=0.5, m_overlap=0.3, noise=(0, 1), p_ubiq=0.3)
+    x2 = sparse_overlap_even(size=(500, 100), rank=2, n_overlap=0.4, m_overlap=0.0, noise=(0, 1), p_ubiq=0.1, feature_scale=True)
+    sns.heatmap(x2)
     # print(x.equals(x2))
 
     # A small

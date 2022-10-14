@@ -173,7 +173,7 @@ class LeaveOneOut(FeatureSelection):
 
 class Permutation(FeatureSelection):
     """Compare the weight of a gene in the component to the distribution of weights learnt from permuted data. Use the
-    probability of getting that weight as an indicate of how related to a component the gene is."""
+    probability of getting that weight as an indication how related to a component the gene is."""
 
     def __init__(self, model: NMFModelSelectionResults, data: pd.DataFrame, permute_learner: NMFModelSelection,
                  permutations: int = 50) -> None:
