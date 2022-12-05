@@ -1519,7 +1519,7 @@ def orientation_tests():
     data = data.T
     # sns.heatmap(data)
     # plt.show()
-    sel: NMFModelSelection = NMFPermutationSelection(data, k_values=[2,6], solver='mu', beta_loss='kullback-leibler',
+    sel: NMFModelSelection = NMFConsensusSelection(data, k_values=[2,6], solver='mu', beta_loss='kullback-leibler',
                                                iterations=10)
     res = sel.run()
 

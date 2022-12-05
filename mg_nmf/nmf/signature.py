@@ -173,7 +173,7 @@ class LeaveOneOut(FeatureSelection):
 
 class Permutation(FeatureSelection):
     """Compare the weight of a gene in the component to the distribution of weights learnt from permuted data. Use the
-    probability of getting that weight as an indication how related to a component the gene is."""
+    probability of getting that weight as an indication of how related to a component the gene is."""
 
     def __init__(self, model: NMFModelSelectionResults, data: pd.DataFrame, permute_learner: NMFModelSelection,
                  permutations: int = 50) -> None:
@@ -259,6 +259,7 @@ class KDEAssignment(FeatureAssignment):
         super().__init__(measure)
         self.cut_low = cut_low
         self.cut_default = cut_default
+        self.__cut_points = [None] * len(measure.columns)
 
     @property
     def cut_low(self) -> bool:
@@ -276,6 +277,10 @@ class KDEAssignment(FeatureAssignment):
     def cut_default(self, cut_default: float) -> None:
         self.__cut_default: float = cut_default
 
+    @property
+    def cut_points(self) -> List[float]:
+        return self.__cut_points
+
     def __assign_component(self, row: pd.Series,) -> pd.Series:
         """Assign genes for one component using KDE method"""
         d = gaussian_kde(row)
@@ -288,6 +293,7 @@ class KDEAssignment(FeatureAssignment):
             cut = self.cut_default
         else:
             cut = x[minima[0 if self.cut_low else 0]]
+        self.__cut_points[list(self.measure.columns).index(row.name)] = cut
         res: pd.Series = row < cut if self.cut_low else row > cut
         return res
 
@@ -357,7 +363,7 @@ class GreedyCorrelationAssignment(FeatureAssignment):
 
     def __assign_feature(self, feature: pd.Series) -> List[bool]:
         desc: pd.Series = self.measure.loc[feature.name].sort_values(ascending=False)
-        # Initialise the set of components this feature belongs to as the one with the highest west
+        # Initialise the set of components this feature belongs to as the one with the highest weight
         assigned: List[str] = [desc.index[0]]
         corr: float = self.__subset_corr(assigned, feature)
         for n_c in desc.index[1:]:
@@ -379,7 +385,7 @@ if __name__ == '__main__':
     from mg_nmf.nmf.synthdata import sparse_overlap_even
 
     # Make a model to work with
-    d = sparse_overlap_even((400, 100), 6, 0.0, 0.0, 0.0, (0, 1))
+    d = sparse_overlap_even((100, 400), 6, 0.0, 0.0, 0.0, (0, 1))
     sel = NMFConsensusSelection(d, k_min=5, k_max=7, solver='mu', beta_loss='kullback-leibler', iterations=20,
                                 nmf_max_iter=10000)
     model = NMFConsensusSelection(d, k_min=5, k_max=7, solver='mu', beta_loss='kullback-leibler', iterations=20,
