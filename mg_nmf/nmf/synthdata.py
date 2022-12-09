@@ -1,12 +1,13 @@
 """Generate synthetic data with a known number of components. Allows generation of overlapping block-diagonal clusters
-with some ubiquitous features. Also make a dense structure by randomly populating W & H.
-Adapted from methods used in Muzzarelli et al., ‘Rank Selection in Non-Negative Matrix Factorization’,
+with some ubiquitous features. Also make a dense structure by randomly populating W & H, whose method is adapted from
+that used in Muzzarelli et al., ‘Rank Selection in Non-Negative Matrix Factorization’,
 https://doi.org/10.1109/IJCNN.2019.8852146.
 """
 
 import numpy as np
 import pandas as pd
 from typing import Tuple, Callable, Optional, List, Union, Any
+
 
 def _unique_index(df: pd.DataFrame, col: bool = True, row: bool = True) -> pd.DataFrame:
     """Make index and column names unique by prefix an ascending numbering."""
@@ -15,6 +16,7 @@ def _unique_index(df: pd.DataFrame, col: bool = True, row: bool = True) -> pd.Da
     if col:
         df.columns = [f'{i}: {df.columns[i]}' for i in range(df.shape[1])]
     return df
+
 
 def sparse_overlap(size: Tuple[int, int], rank: int, n_overlap: float = 0.0, m_overlap: float = 0.0,
                    p_ubiq: float = 0.0, noise: Optional[Tuple[float, float]] = (0, 1),
@@ -63,14 +65,15 @@ def sparse_overlap(size: Tuple[int, int], rank: int, n_overlap: float = 0.0, m_o
     # Make X
     X: pd.DataFrame = pd.DataFrame(W.dot(H), columns=H.columns, index=W.index)
 
-    #Apply noise
+    # Apply noise
     if noise is not None:
         mean, sd = noise
         X = _apply_normal_noise(X, mean, sd)
 
     return _unique_index(X), _unique_index(W, cols=False), _unique_index(H, rows=False)
 
-def _create_overlap(size: Tuple[int, int], overlap: float, fill: Callable[[int], np.ndarray]):
+
+def _create_overlap(size: Tuple[int, int], overlap: float, fill: Callable[[int], np.ndarray]) -> pd.DataFrame:
     """Create a matrix of size m x n, with a number of diagonal blocks where a proportion of them overlap.
 
     size: Tuple[int, int] - Size of matrix, m x n. m will be used as the number of components.
@@ -104,6 +107,7 @@ def _create_overlap(size: Tuple[int, int], overlap: float, fill: Callable[[int],
 
     return _unique_index(pd.DataFrame(matrix, columns=n_labels, index=c_labels))
 
+
 def _apply_normal_noise(matrix: np.ndarray, mu: float, sigma: float, scale_coeff: np.ndarray) -> np.ndarray:
     """Apply normally distributed noise to a matrix.
 
@@ -124,8 +128,10 @@ def _apply_normal_noise(matrix: np.ndarray, mu: float, sigma: float, scale_coeff
     matrix = np.where(matrix < 0, 0, matrix)
     return matrix
 
+
 def __defualt_row_scale(size: int) -> float:
     return np.random.uniform(1, 10, size)
+
 
 def sparse_overlap_even(size: Tuple[int, int], rank: int, n_overlap: float = 0.0, m_overlap: float = 0.0,
                    p_ubiq: float = 0.0, noise: Optional[Tuple[float, float]] = (0, 1),
@@ -220,10 +226,12 @@ def sparse_overlap_even(size: Tuple[int, int], rank: int, n_overlap: float = 0.0
     # Convert to labelled DataFrame
     return _unique_index(pd.DataFrame(matrix, index=m_labels, columns=n_labels))
 
+
 def multipathway(size: Tuple[int, int], rank: int, noise: Optional[Tuple[float, float]], m_prob: List[float],
                  n_prob: List[float], feature_scale: Union[bool, Callable[[], np.array]] = True) -> pd.DataFrame:
     """Create a matrix where each gene is assigned to a cluster probabilistically, and the same for each sample.
-    Will create a denser structure than sparse_overlap, with more genes and sample spanning 2+ components."""
+    Will create a denser structure than sparse_overlap, with more genes and sample spanning 2+ components. Unused
+    during thesis work."""
     m, n = size
     matrix: np.ndarray = np.ndarray(size)
 
@@ -275,6 +283,7 @@ def multipathway(size: Tuple[int, int], rank: int, noise: Optional[Tuple[float, 
     tbl.columns = n_idx
     return _unique_index(tbl)
 
+
 def dense(size: Tuple[int, int], rank: int, noise: Optional[Tuple[float, float]] = (0, 1),
           fill: Callable[[int, int], np.ndarray] = np.random.rand) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Create matrix with a dense underlying structure. Create randomly filled H & W, X = W x H + noise.
@@ -300,6 +309,7 @@ def dense(size: Tuple[int, int], rank: int, noise: Optional[Tuple[float, float]]
         mu, sigma = noise
         X = _apply_normal_noise(X, mu, sigma)
     return _unique_index(X), _unique_index(W, cols=False), _unique_index(H, rows=False)
+
 
 if __name__ == "__main__":
     # Some testing

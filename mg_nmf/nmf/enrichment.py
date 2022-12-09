@@ -20,10 +20,9 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
-
-# Local imports
 from tqdm import tqdm
 
+# Local imports
 from mg_nmf.nmf import selection
 from mg_nmf.nmf import signature
 

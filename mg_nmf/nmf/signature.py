@@ -17,10 +17,25 @@ import scipy.stats as stats
 
 
 class FeatureSelection():
-    """Defines an interface for feature selection methods for NMF results."""
+    """Abstract class handle feature importance methods for NMF results.
+
+    Public methods:
+    select                              -- generate the feature importance measures
+
+    Instance variables:
+    model:NMFModelSelectionResults      -- the model to evaluate
+    data: DataFrame                     -- the input data this model was generated from
+    feature_name: str                   -- the name of the feature in the input data
+    """
 
     def __init__(self, model: NMFModelSelectionResults, data: pd.DataFrame) -> None:
-        """Intialise class."""
+        """Intialise feature importance method.
+
+        :param model: Model to evaluate
+        :type model: DataFrame
+        :param data: Input data model was learnt from
+        :type data: DataFrame
+        """
         self.__model: NMFModelSelectionResults = model
         self.__data: pd.DataFrame = data
         self.__feature_name = data.index.name
@@ -42,7 +57,11 @@ class FeatureSelection():
 
     def select(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Perform feature selection, returns results as data frames. First is the measure, second is p-value if
-        possible."""
+        possible.
+
+        :return: DataFrame giving feature importance, and if available p-values.
+        :rtype: Tuple[DataFrame, Optional[DataFrame]]
+        """
         pass
 
 
@@ -63,7 +82,11 @@ class Specificity(FeatureSelection):
         super().__init__(model, data)
 
     def select(self) -> pd.DataFrame:
-        """Perform selection for each gene in the data."""
+        """Generate specifity measure.
+
+        :return: Returns the specificty of features for each module, p-values not available.
+        :rtype: Tuple[DataFrame, None]
+        """
         rs: List[Tuple[str, float]] = []
         for index, row in self.model.h.T.iterrows():
             sqrt_k = math.sqrt(self.model.k)
@@ -96,7 +119,11 @@ class Correlation(FeatureSelection):
         super().__init__(model, data)
 
     def select(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Correlate each component in model with each gene in source data."""
+        """Generate correlation feature importance measure.
+
+        :return: Return the correlation of each feature and module, and the p-value for these correlations
+        :rtype: Tuple[DataFrame, DataFrame]
+        """
         # Handle one component at a time
         component: str = ''
         r_frame: pd.DataFrame = None
@@ -152,7 +179,11 @@ class LeaveOneOut(FeatureSelection):
 
     def select(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Compute correlations between X and WH with one component at a time left out of WH. A decrease in correlation
-        compared to full WH indicates that the gene is significant to that component."""
+        compared to full WH indicates that the gene is significant to that component.
+
+        :return: Return the LOOCD of each feature and module, p-value not available
+        :rtype: Tuple[DataFrame, None]
+        """
         wh: pd.DataFrame = self.model.w.dot(self.model.h)
         corr_complete: pd.Series = wh.corrwith(self.model.data, axis=0)
         delta_corr: List[pd.series] = []
@@ -173,11 +204,22 @@ class LeaveOneOut(FeatureSelection):
 
 class Permutation(FeatureSelection):
     """Compare the weight of a gene in the component to the distribution of weights learnt from permuted data. Use the
-    probability of getting that weight as an indication of how related to a component the gene is."""
+    probability of getting that weight as an indication of how related to a component the gene is.
+
+    Instance variables:
+    permute_leanrer: NMFModelSelection      -- Object to performed learning on permuated data
+    permutations: int                       -- Number of times to perform permuted learning
+    """
 
     def __init__(self, model: NMFModelSelectionResults, data: pd.DataFrame, permute_learner: NMFModelSelection,
                  permutations: int = 50) -> None:
-        """Must provide a model section method with the parameters for training on the permuted data set."""
+        """Must provide a model section method with the parameters for training on the permuted data set.
+
+        :param permute_learner: NMFModelSelection object to perform the permuted learning
+        :type permute_learner: NMFModelSelection
+        :param permutations: Number of times to perform permuted learning
+        :type permutations: int
+        """
         super().__init__(model, data)
         self.permute_learner = permute_learner
         self.permutations = permutations
@@ -220,7 +262,11 @@ class Permutation(FeatureSelection):
 
     def select(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Learn models on permuted data, assess importance of feature to component by looking at probability of model
-        weight coming from distribution fitted to weights from permuted data."""
+        weight coming from distribution fitted to weights from permuted data.
+
+        :return: Probability of observed weight being drawn from weights learnt by permutation, no other p-values
+        :rtype: Tuple[DataFrame, None]
+        """
         # Run permuted learning
         perm_tbl = pd.concat([self.__run_permutation() for i in range(self.permutations)], axis=1)
         # Find probabilities that a given weight would be drawn from distribution of permuted weights
@@ -231,7 +277,11 @@ class Permutation(FeatureSelection):
 class FeatureAssignment:
     """Defines an interface for methods to perform binary assignments of features to components."""
     def __init__(self, measure: pd.DataFrame) -> None:
-        """Intialise class."""
+        """Intialise class.
+
+        :param measure: Table of the feature importance measure
+        :type: DataFrame
+        """
         self.__measure: pd.DataFrame = measure
 
     @property
@@ -240,8 +290,11 @@ class FeatureAssignment:
         return self.__measure
 
     def assign(self) -> pd.DataFrame:
-        """Perform feature selection, returns results as data frames. First is the measure, second is p-value if
-        possible."""
+        """Perform feature assignment, returning a boolean table indicating which features are assigned to a module.
+
+        :return: Boolean table of feature assignments to modules
+        :rtype: DataFrame
+        """
         pass
 
 
@@ -298,7 +351,11 @@ class KDEAssignment(FeatureAssignment):
         return res
 
     def assign(self) -> pd.DataFrame:
-        """Assign genes to one or more components"""
+        """Assign genes to one or more components.
+        
+        :return: Boolean table of feature assignments to modules
+        :rtype: DataFrame
+        """
         c_res: List[pd.Series] = self.measure.apply(self.__assign_component, axis=0)
         return c_res
 
@@ -327,6 +384,11 @@ class ThresholdAssignment(FeatureAssignment):
         self.__cut_low: bool = cut_low
 
     def assign(self) -> pd.DataFrame:
+        """Assign features to modules based on specified threshold
+
+        :return: Boolean table of feature assignments to modules
+        :rtype: DataFrame
+        """
         return self.measure < self.threshold if self.cut_low else self.measure > self.threshold
 
 
@@ -378,24 +440,9 @@ class GreedyCorrelationAssignment(FeatureAssignment):
         return pd.Series([x in assigned for x in self.model.h.index], index=self.model.h.index, name=feature.name)
 
     def assign(self) -> pd.DataFrame:
+        """Assign features to one or more modules
+
+        :return: Boolean table of feature assignments to modules
+        :rtype: DataFrame
+        """
         return self.model.data.apply(self.__assign_feature, axis=0).T
-
-if __name__ == '__main__':
-    from mg_nmf.nmf.selection import NMFConsensusSelection
-    from mg_nmf.nmf.synthdata import sparse_overlap_even
-
-    # Make a model to work with
-    d = sparse_overlap_even((100, 400), 6, 0.0, 0.0, 0.0, (0, 1))
-    sel = NMFConsensusSelection(d, k_min=5, k_max=7, solver='mu', beta_loss='kullback-leibler', iterations=20,
-                                nmf_max_iter=10000)
-    model = NMFConsensusSelection(d, k_min=5, k_max=7, solver='mu', beta_loss='kullback-leibler', iterations=20,
-                                  nmf_max_iter=10000).run()
-    model_use = model[0].selected
-    r = Correlation(model_use, d).select()
-    s = Specificity(model_use, d).select()
-    l = LeaveOneOut(model_use, d).select()
-    p = Permutation(model_use, d, sel, 10).select()
-    kd = KDEAssignment(p[0], cut_low=True, cut_default=0.05).assign()
-    ts = ThresholdAssignment(p[0], cut_low=True, threshold=0.05).assign()
-    gd = GreedyCorrelationAssignment(r[0], model=model_use, delta=0.05).assign()
-    print(kd)
