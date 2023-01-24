@@ -132,7 +132,7 @@ def heatmap_plot(result: selection.NMFModelSelectionResults, w_dot_h: bool = Fal
 
 def cophenetic_plot(result: selection.NMFResults, file: str = None) -> None:
     """Plot the cophenetic correlation as a line plot."""
-    data: pd.DataFrame = result.cophenetic_correlation()
+    data: pd.DataFrame = result.measure()
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=data.iloc[0], y=data.iloc[1]))
     if file is None:
@@ -146,7 +146,15 @@ def multiselect_plot(result: selection.NMFMultiSelect, file: str = None, figsize
     # Determine cols / rows
     rows = math.ceil(float(len(result)) / float(cols))
 
-    fig = make_subplots(rows=rows, cols=cols, subplot_titles=list(result.keys()))
+    # Rename methods to be more readable
+    rename_dict = dict(disp='Dispersion', coph='Cophenetic<br />Correlation', perm='Permutation',
+                       conc='Concordance<br />Index', mse='Mean Standard Error', mad='Median Absolute Deviation',
+                       split='Split-Half')
+
+    method_order = list(result.keys())
+    sp_titles = [rename_dict[x] if x in rename_dict.keys() else x for x in method_order]
+
+    fig = make_subplots(rows=rows, cols=cols, subplot_titles=sp_titles)
 
     colors = px.colors.qualitative.Plotly
 
@@ -154,8 +162,9 @@ def multiselect_plot(result: selection.NMFMultiSelect, file: str = None, figsize
     col = 1
     color = 0
 
-    for method, results in result.items():
-        data = results.cophenetic_correlation()
+    for method in method_order:
+        res = result[method]
+        data = res.measure()
 
         # Want to provide a warning if permutation method has any cases where it failed to reach a stopping condition
         if method == 'perm':
@@ -165,10 +174,12 @@ def multiselect_plot(result: selection.NMFMultiSelect, file: str = None, figsize
                 print('WARNING')
                 print(f'Permutation method failed to reach stopping condition in {missing:.2%} of runs')
                 print('Consider raising value of k searched if failing in high proportion of runs')
-
-        fig.append_trace(go.Scatter(
+        method_name = method
+        if method in rename_dict.keys():
+            method_name = rename_dict[method]
+        fig.add_trace(go.Scatter(
             y=data.iloc[1, :].astype('float64'), x=data.iloc[0, :], mode='lines', line=dict(color=colors[color]), showlegend=False,
-            name=method
+            name=method_name
         ), row=row, col=col)
         col += 1
         color += 1
@@ -318,7 +329,7 @@ def model_to_piemap(h: pd.DataFrame, coords: pd.DataFrame, lat_lon: Tuple[str, s
             ax.scatter([rlat], [rlon], marker=xy_arr, s=pie_size * s, facecolor=colors[i],
                        linewidth=0.0, alpha=alpha)
             if first:
-                ax.scatter([], [], label=f'c{i+1}', facecolor=colors[i])
+                ax.scatter([], [], label=f'm{i+1}', facecolor=colors[i])
         first = False
     plt.legend()
     return fig, ax
@@ -421,17 +432,17 @@ def rgb_to_string(df):
 if __name__ == '__main__':
     # Some tests
     rnd_data: pd.DataFrame = selection.shuffle_frame(selection.synthdata.sparse_overlap_even(
-        rank=3, noise=(0, 2), size=(500, 100), p_ubiq=0.0, m_overlap=0.0, n_overlap=0.0)
+        rank=3, noise=(0, 2), size=(100, 500), p_ubiq=0.0, m_overlap=0.0, n_overlap=0.0)
     )
 
     # Apply multiselect to see if we can get warnings
-    ms = selection.NMFMultiSelect(ranks=list(range(2, 6)), methods=['perm'], iterations=50,
+    ms = selection.NMFMultiSelect(ranks=list(range(2, 6)), methods=['perm'], iterations=10,
                                   beta_loss='kullback-leibler', solver='mu')
     ms_res = ms.run(rnd_data)
     multiselect_plot(ms_res)
 
     # Apply standard NMF
-    selector = selection.NMFConsensusSelection(rnd_data, k_min=3, k_max=4, solver='mu', beta_loss='kullback-leibler',
+    selector = selection.NMFConsensusSelection(rnd_data, k_min=2, k_max=7, solver='mu', beta_loss='kullback-leibler',
                                             iterations=10, nmf_max_iter=10000)
     results: selection.NMFResults = selector.run()
 

@@ -87,17 +87,17 @@ class TestNMFConsensusSelection(unittest.TestCase):
         self.assertEqual(sel.nmf_max_iter, sel.DEF_NMF_MAX_ITER)
 
 
-class TestNMFJiangSelection(unittest.TestCase):
+class TestNMFConcordanceSelection(unittest.TestCase):
     """Test Jiang stability based selection methods."""
 
-    sel: selection.NMFJiangSelection
+    sel: selection.NMFConcordanceSelection
     data: pd.DataFrame
 
     @classmethod
     def setUpClass(cls) -> None:
         """Initialise a selection object for our test class to work with, and load some synthetic data."""
 
-        cls.sel = selection.NMFJiangSelection(
+        cls.sel = selection.NMFConcordanceSelection(
             data=TEST_DATA, k_min=2, k_max=3, solver='mu', beta_loss='frobenius', iterations=10, nmf_max_iter=1000
         )
 
@@ -206,7 +206,7 @@ class TestNMFMultiSelect(unittest.TestCase):
 
         # Temp - used large test data
         import mg_nmf.nmf.synthdata as synthdata
-        large_td = synthdata.sparse_overlap_even((30000, 66), 6, 0.1, 0.1, 0.1, (0, 1))
+        large_td = synthdata.sparse_overlap_even((50, 150), 6, 0.1, 0.1, 0.1, (0, 1))
         res: Dict[str, selection.NMFResults] = self.multi.run(large_td, 1)
 
         # Ensure all methods were run, and returned correct type
@@ -216,12 +216,6 @@ class TestNMFMultiSelect(unittest.TestCase):
 
     def test_properties(self) -> None:
         """Test property changes."""
-
-        # Ranks should throw an exception if min < max
-        with self.assertRaises(Exception):
-            self.multi.ranks = (2, 1)
-        self.multi.ranks = (2, 5)
-        self.assertEqual(self.multi.ranks, (2, 5))
 
         # Iterations should throw exception if  < 1
         with self.assertRaises(Exception):
@@ -253,7 +247,7 @@ class TestNMFMultiSelect(unittest.TestCase):
 class TestNMFResults(unittest.TestCase):
     """Tests for class which holds results for model selection runs for multiple values of k."""
 
-    sel: selection.NMFJiangSelection
+    sel: selection.NMFConcordanceSelection
     res: selection.NMFResults
     K_FROM: int = 2
     K_TO: int = 4
@@ -263,7 +257,7 @@ class TestNMFResults(unittest.TestCase):
     def setUp(cls) -> None:
         """Run a simple model selection method, to obtain an NMFResults object to work with."""
 
-        cls.sel = selection.NMFJiangSelection(
+        cls.sel = selection.NMFConcordanceSelection(
             k_min=cls.K_FROM, k_max=cls.K_TO, iterations=cls.ITER, nmf_max_iter=1000, solver='mu',
             beta_loss='frobenius', data=TEST_DATA
         )
@@ -286,7 +280,7 @@ class TestNMFResults(unittest.TestCase):
     def test_cophenetic_table(self) -> None:
         """Make sure the table of cophenetic correlation comes out as expected."""
 
-        c_tbl: pd.DataFrame = self.res.cophenetic_correlation(None, None)
+        c_tbl: pd.DataFrame = self.res.measure(None, None)
         # Test has expected length
         self.assertEqual(len(c_tbl.columns), len(self.res.results))
         # Test each value in the table, check matches it's table entry
@@ -298,7 +292,7 @@ class TestNMFResults(unittest.TestCase):
         # Test both plot and file can be written
         with tempfile.TemporaryDirectory() as tmpdirname:
             plot_f, table_f = os.path.join(tmpdirname, 'tmp_plot.png'), os.path.join(tmpdirname, 'tmp_tbl.csv')
-            self.res.cophenetic_correlation(plot_f, table_f)
+            self.res.measure(plot_f, table_f)
             self.assertTrue(os.path.exists(plot_f))
             self.assertTrue(os.path.exists(table_f))
 

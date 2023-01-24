@@ -187,16 +187,16 @@ def sparse_overlap_even(size: Tuple[int, int], rank: int, n_overlap: float = 0.0
         n_start = k * n_per_k
         n_end = min(n, n_start + n_per_k + n_per_over)
         # Handle labelling
-        n_labels[n_start:n_end] = [f'c{str(k)}'] * (n_end - n_start)
+        n_labels[n_start:n_end] = [f'm{str(k)}'] * (n_end - n_start)
         if k > 0:
-            n_labels[n_start:n_start+n_per_over] = [f'c{str(k-1)}|c{str(k)}'] * n_per_over
+            n_labels[n_start:n_start+n_per_over] = [f'm{str(k-1)}|m{str(k)}'] * n_per_over
 
         # Row positions & labels
         m_start = k * m_per_k
         m_end = min(non_ubiq, m_start + m_per_k + m_per_over)
-        m_labels[m_start:m_end] = [f'c{str(k)}'] * (m_end - m_start)
+        m_labels[m_start:m_end] = [f'm{str(k)}'] * (m_end - m_start)
         if k > 0:
-            m_labels[m_start:m_start + m_per_over] = [f'c{str(k - 1)}|c{str(k)}'] * m_per_over
+            m_labels[m_start:m_start + m_per_over] = [f'm{str(k - 1)}|m{str(k)}'] * m_per_over
 
         # Embed block in matrix
         matrix[m_start:m_end, n_start:n_end] = fill(m_end - m_start, n_end - n_start)

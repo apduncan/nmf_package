@@ -337,8 +337,8 @@ class NMFModelSelection(ABC):
                     w = norm.normalise(self.normalise(w, self.normalise_arg), w, None)[0]
                 # Convert to a dataframe with correct indexing
                 w = pd.DataFrame(data=w, index=data.index,
-                                 columns=[f'c{x}' for x in range(1, k + 1)])
-                w.index.name = 'ko'
+                                 columns=[f'm{x}' for x in range(1, k + 1)])
+                w.index.name = 'samples'
                 u: pd.DataFrame = self.filter(w, self.filter_threshold)
                 # Restrict source data to these indices
                 reduced: pd.DataFrame = data.loc[u.index]
@@ -440,7 +440,6 @@ class NMFConsensusSelection(NMFModelSelection):
             c_matrices = list(map(self._create_connectivity_matrix, model_args))
             pool.close()
         c_bar: pd.DataFrame = ConnectivityMatrix.c_bar(c_matrices)
-        print("Make c_bar", time.time() - tfrom)
         tfrom = time.time()
         # Find cophenetic correlation value
         c, co_distt = ConnectivityMatrix.cophenetic_corr(c_bar)
@@ -456,7 +455,7 @@ class NMFConsensusSelection(NMFModelSelection):
                 w_norm: pd.DataFrame = norm.normalise(self.normalise(w, self.normalise_arg), w, None)[0]
             # Convert to df with correct indexing
             w_norm.columns = components
-            w_norm.index.name = 'ko'
+            w_norm.index.name = 'samples'
             # Filter
             u: pd.DataFrame = self.filter(w_norm, self.filter_threshold)
             # Reduce W to the restricted list
@@ -466,11 +465,10 @@ class NMFConsensusSelection(NMFModelSelection):
             w, h = norm.normalise(self.normalise(w, self.normalise_arg), w, h)
         w_res: pd.DataFrame = pd.DataFrame(data=w.values, index=w.index,
                                            columns=components)
-        w_res.index.name = 'ko'
+        w_res.index.name = 'samples'
         h_res: pd.DataFrame = pd.DataFrame(data=h, index=components,
                                            columns=self.data.columns)
-        h_res.index.name = 'component'
-        print("End processing", time.time() - tfrom)
+        h_res.index.name = 'modules'
         return (
             NMFModelSelectionResults(k, c, c_bar, w_res, h_res, best_model, self.data),
             NMFModelSelectionResults(k, dispersion, c_bar, w_res, h_res, best_model, self.data)
@@ -478,7 +476,7 @@ class NMFConsensusSelection(NMFModelSelection):
 
 
 # noinspection SpellCheckingInspection
-class NMFJiangSelection(NMFModelSelection):
+class NMFConcordanceSelection(NMFModelSelection):
     """Similarity selection from  Jiang, X., Weitz, J. S. & Dushoff, J. A non-negative matrix factorization framework
     for identifying modular patterns in metagenomic profile data. J. Math. Biol. 64, 697–711 (2012).
     """
@@ -486,7 +484,7 @@ class NMFJiangSelection(NMFModelSelection):
     @property
     def metrics(self) -> List[str]:
         """The metrics available from using this class."""
-        return ['jiang']
+        return ['condordance']
 
     def run(self, processes: int = 1) -> NMFResults:
         """Run process for model selection of NMF.
@@ -585,7 +583,7 @@ class NMFJiangSelection(NMFModelSelection):
                 w_norm: pd.DataFrame = norm.normalise(self.normalise(w_model, self.normalise_arg), w_model, None)[0]
             # Convert to df with correct indexing
             w_norm.columns = components
-            w_norm.index.name = 'ko'
+            w_norm.index.name = 'samples'
             # Filter
             u: pd.DataFrame = self.filter(w_norm, self.filter_threshold)
             # Reduce W to the restricted list
@@ -593,10 +591,10 @@ class NMFJiangSelection(NMFModelSelection):
         h_model = best_H
         w: pd.DataFrame = pd.DataFrame(data=w_model.values, index=w_model.index,
                                        columns=components)
-        w.index.name = 'ko'
+        w.index.name = 'samples'
         h: pd.DataFrame = pd.DataFrame(data=h_model, index=components,
                                        columns=self.data.columns)
-        h.index.name = 'component'
+        h.index.name = 'modules'
         return NMFModelSelectionResults(k, ci, None, w, h, best_model, self.data)
 
 
@@ -903,7 +901,11 @@ class NMFImputationSelection(NMFModelSelection):
         H: pd.DataFrame = pd.DataFrame(best_model.V, columns=self.data.columns, index=components)
         # Use median MSE as metric
         median_mse: float = np.median(metrics)
-        mad: float = stats.median_absolute_deviation(metrics)
+        # Median absolute deviation function name changed in scipy - want to handle both
+        if hasattr(stats, 'median_abs_deviation'):
+            mad: float = stats.median_abs_deviation(metrics)
+        else:
+            mad: float = stats.median_absolute_deviation(metrics)
         mse_result, mad_result = (
             NMFModelSelectionResults(k, median_mse, None, W, H, best_model, self.data),
             NMFModelSelectionResults(k, mad, None, W, H, best_model, self.data)
@@ -928,7 +930,7 @@ class NMFMultiSelect:
 
     # noinspection SpellCheckingInspection
     PERMITTED_METHODS: List[str] = [
-        'coph', 'disp', 'jiang', 'perm', 'split', 'mse', 'mad'
+        'coph', 'disp', 'conc', 'perm', 'split', 'mse', 'mad'
     ]
 
     def __init__(self, ranks: List[int], methods: List[str] = None, iterations: int = None,
@@ -1029,12 +1031,12 @@ class NMFMultiSelect:
             res['coph'] = coph
             res['disp'] = disp
 
-        if 'jiang' in self.methods:
-            sel_jiang: NMFModelSelection = NMFJiangSelection(data, k_values=self.ranks, solver=self.solver,
-                                                             beta_loss=self.beta_loss, iterations=self.iterations,
-                                                             nmf_max_iter=self.nmf_max_iter)
-            jiang = sel_jiang.run(processes)
-            res['jiang'] = jiang
+        if 'conc' in self.methods:
+            sel_conc: NMFModelSelection = NMFConcordanceSelection(data, k_values=self.ranks, solver=self.solver,
+                                                                   beta_loss=self.beta_loss, iterations=self.iterations,
+                                                                   nmf_max_iter=self.nmf_max_iter)
+            conc = sel_conc.run(processes)
+            res['conc'] = conc
 
         if 'perm' in self.methods:
             sel_perm: NMFModelSelection = NMFPermutationSelection(data, k_values=self.ranks,
@@ -1069,7 +1071,7 @@ class NMFResults:
     """Provide results and output methods from the NMFModel selection process.
     
     Public methods:
-    cophenetic_correlation(plot_file, table_file)   -- Return cophenetic correlation for each value of k.
+    measure(plot_file, table_file)   -- Return cophenetic correlation for each value of k.
                                                        Optionally output a plot and csv to file.
 
     Instance variables:
@@ -1114,9 +1116,9 @@ class NMFResults:
         """Return the input data."""
         return self.__data
 
-    def cophenetic_correlation(self, plot: str = None, table: str = None
-                               ) -> pd.DataFrame:
-        """Return a table of the cophenetic correlation against k and output.
+    def measure(self, plot: str = None, table: str = None
+                ) -> pd.DataFrame:
+        """Return a table of the rank selection measure against k and output.
 
         :param plot: location to output a line chart of data to
         :type plot: str
@@ -1129,7 +1131,7 @@ class NMFResults:
         else:
             c: List[float] = [float(x.metric) for x in self.results]
         ks: List[int] = [x.k for x in self.results]
-        arr: np.array = np.array([['k'] + ks, ['cophenetic_correlation'] + c])
+        arr: np.array = np.array([['k'] + ks, ['measure'] + c])
         data: pd.DataFrame = pd.DataFrame(data=arr[:, 1:], index=arr[:, 0:1])
         # Ensure using float as datatype for the criteria values
         # TEMP TIMING
@@ -1138,14 +1140,27 @@ class NMFResults:
         if plot is not None:
             # Output plot desired
             _ = plt.figure()
-            plt.title('Cophenetic correlation for varying k')
+            plt.title('Measure across ranks')
             plt.xlabel('k')
-            plt.ylabel('cophenetic correlation')
+            plt.ylabel('measure')
             plt.plot(ks, c)
             plt.savefig(plot)
         if table is not None:
             data.to_csv(table)
         return data
+
+    def result_for_k(self, k: int) -> NMFModelSelectionResults:
+        """Return the model selection results for the specified rank k. Useful for exporing ranks near the elbow
+        points to identify nost suitable rank.
+
+        :param k: Rank to get results for
+        :type k: int
+        """
+
+        try:
+            return next(x for x in self.results if x.k == k)
+        except StopIteration:
+            raise Exception(f'No results found for rank {k}')
 
     def write_results(self, file: str) -> None:
         """Dump this object to a file.
@@ -1219,6 +1234,7 @@ class NMFModelSelectionResults:
         self.__h: pd.DataFrame = h
         self.__model: NMF = model
         self.__data: pd.DataFrame = data
+        self.__name_dfs()
 
     @property
     def k(self) -> int:
@@ -1262,6 +1278,19 @@ class NMFModelSelectionResults:
     def __repr__(self) -> str:
         """Return representation of the this object."""
         return f'<{str(self)}>'
+
+    def __name_dfs(self) -> None:
+        """Give the indices W, H the correct names."""
+        # W
+        if self.__w is not None:
+            self.__w.columns = [f'm{i}' for i in range(1, len(self.__w.columns)+1)]
+            self.__w.columns.name = 'modules'
+            self.__w.index.name = self.__data.index.name
+        # H
+        if self.__h is not None:
+            self.__h.index = [f'm{i}' for i in range(1, len(self.__h.index) + 1)]
+            self.__h.index.name = 'modules'
+            self.__h.columns.name = self.__data.columns.name
 
     @staticmethod
     def _write_df(df: pd.DataFrame, file: str = None) -> None:
@@ -1505,7 +1534,7 @@ def tests() -> None:
                         solver='mu', methods=['coph', 'disp'])
     results = select.run(data)
     print(results['jiang'].selected.k)
-    print(results['jiang'].cophenetic_correlation().T)
+    print(results['jiang'].measure().T)
 
     from mg_nmf.nmf import visualise
     visualise.multiselect_plot(results).show()
