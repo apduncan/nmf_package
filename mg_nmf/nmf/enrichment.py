@@ -808,7 +808,7 @@ class GeneSets(object):
 
     def _kegg_list(self, database: str, org: Optional[str]) -> Collection[str]:
         with self._kegg_list_resp(database, org) as f:
-            pathway_list: List[str] = [x.split('\t')[0].split(':')[1] for x in f.readlines()]
+            pathway_list: List[str] = [x.split('\t')[0] for x in f.readlines()]
         return pathway_list
 
     def _kegg_link_resp(self, target: str, source: str) -> TextIO:
@@ -879,7 +879,7 @@ class GeneSets(object):
         kegg_md: Dict[str, Dict[str, Any]] = {}
         for line in (x.strip() for x in kegg_resp.readlines()):
             cols: List[str] = line.split('\t')
-            pathway: str = cols[0].split(':')[1]
+            pathway: str = cols[0]
             name: str = cols[1]
             kegg_md[pathway] = dict(name=name)
         return kegg_md
@@ -894,7 +894,7 @@ class GeneSets(object):
         resp_dict: Dict[str, str] = {}
         for line in (x.strip() for x in resp.readlines()):
             cols: List[str] = line.split('\t')
-            ko: str = cols[0].split(':')[1]
+            ko: str = cols[0]
             name: str = cols[1]
             resp_dict[ko] = name
         return resp_dict
@@ -916,34 +916,35 @@ if __name__ == '__main__':
     from mg_nmf.nmf.selection import NMFResults, NMFModelSelectionResults
 
     # # Load some premade model results
-    MODEL_RES = '/home/hal/nmf/rerun_surf.res'
+    # MODEL_RES = '/home/hal/nmf/rerun_surf.res'
     # MODEL_RES = '/media/hal/safe_hal/work/nmf_otherenv/sediment/error_model.pickle'
     # res = selection.NMFModelSelectionResults.load_model(MODEL_RES)
-    with open(MODEL_RES, 'rb') as f:
-        res = load(f)
-        res = res['coph'].selected
+    # with open(MODEL_RES, 'rb') as f:
+        # res = load(f)
+        # res = res['coph'].selected
     # Load a custom genset
-    with open('/media/hal/safe_hal/work/nmf_otherenv/sediment/error_geneset.pickle', 'rb') as f:
-        resgenes = load(f)
+    # with open('/media/hal/safe_hal/work/nmf_otherenv/sediment/error_geneset.pickle', 'rb') as f:
+        # resgenes = load(f)
     # res = res['coph'].selected
     # Make an analysis object
     # analysis: NMFGeneSetEnrichment = NMFGeneSetEnrichment(model=res, data=res.data,
     #                                                       gene_sets=resgenes,
     #                                                       processes=4, min_size=5,
     #                                                       max_size=None)
-    analysis: NMFGeneSetEnrichment = NMFGeneSetEnrichment(model=res, data=res.data,
-                                                          gene_sets=GeneSets().geneset_ipr2go(),
-                                                          gene_set_metadata=GeneSets().geneset_metadata_go(),
-                                                          gene_names=GeneSets().geneid_names_interpro(),
-                                                          label='go', processes=4, min_size=5,
-                                                          max_size=None)
-    anres = analysis.results(0.05)
+    # analysis: NMFGeneSetEnrichment = NMFGeneSetEnrichment(model=res, data=res.data,
+    #                                                       gene_sets=GeneSets().geneset_ipr2go(),
+    #                                                       gene_set_metadata=GeneSets().geneset_metadata_go(),
+    #                                                       gene_names=GeneSets().geneid_names_interpro(),
+    #                                                       label='go', processes=4, min_size=5,
+    #                                                       max_size=None)
+    # anres = analysis.results(0.05)
     # with open('../tests/data/large_enrichment', 'rb') as f:
     #     analysis: NMFGeneSetEnrichment = load(f)
-    pd.set_option('display.max_columns', None)
-    res = analysis.results(significance=0.05)
-    print(analysis.results(significance=0.05))
-    analysis.plot_enrichment(res).show()
+    # pd.set_option('display.max_columns', None)
+    # res = analysis.results(significance=0.05)
+    # print(analysis.results(significance=0.05))
+    # analysis.plot_enrichment(res).show()
     # analysis.plot_geneset_correlation('c1', 'GO:0009055').show()
     # analysis.plot_gsea('c1', 'GO:0009055', ofname='t.png')
     # dump(analysis, open('/home/hal/Dropbox/PHD/FunctionalAbundance/nmf/data/metatranscriptome_k6.enrich', 'wb+'))
+    # GeneSets().geneid_names_ko

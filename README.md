@@ -70,8 +70,8 @@ data = pd.read_csv('mg_data.csv')
 # Here, methods takes a list of the methods to run, ranks is a collection of the ranks for which to run each method
 # Other parameters are covered in the docstring
 rank_selection = NMFMultiSelect(
-    methods=['coph', 'disp', 'jiang', 'perm', 'split'], ranks=range(2, 21), 
-    iterations=100, beta_loss='kullback-liebler'
+    methods=['coph', 'disp', 'conc', 'perm', 'split'], ranks=range(2, 21), 
+    iterations=100, beta_loss='kullback-leibler'
 )
 
 # Run rank selection methods for the loaded data
@@ -126,9 +126,9 @@ enr.plot_enrichment(enr_res)
 # It may be of interest to examine two associated plots for each set of genes: the GSEA diagram, and scatter plots 
 # showing the correlation underlyign that GSEA diagram
 # In this example, we look at plots for enrichment of the Riboflavin Metabolism pathway (map00740) in module m1
-enr.plot_gsea(module='m1', gene_set_id='map00740', ofname='output_file.png')
+enr.plot_gsea(component='m1', gene_set_id='map00740', ofname='output_file.png')
 # This returns a plotly plot, which can be shown or written to disk
-fig = enr.plot_geneset_correlation(module='m1', gene_set_id='map00740', cols='4')
+fig = enr.plot_geneset_correlation(component='m1', gene_set_id='map00740', cols='4')
 fig.show()
 fig.write_image('output_file.pdf')
 ```
@@ -165,9 +165,10 @@ compared to LOOCD.
 from mg_nmf.nmf import signature
 # All classes share the same signature, here we will use LOOCD but others are used in the same way
 loocd = signature.LeaveOneOut(model=model, model=model.data)
-loocd_res = loocd.select()
+loocd_res, _ = loocd.select()
 # This will return a table with the importance measure for each feature in each module, in this case how much the 
 # correlation decreases by when each module is left out. A lower value indicates greater importance for LOOCD.
+# The method returns a tuple, as some classes also return a table of significances, but LOOCD does not currently.
 ```
 
 #### Feature Assignment
@@ -191,7 +192,7 @@ $X$ above a certain threshold. This method performed poorly compared to those ab
 ```python
 from mg_nmf.nmf import signature
 # Using the LOOCD results we obtained earlier, perform assignment using the default threshold
-assign = signature.ThresholdAssignment(measure=loocd_res, cut_low=True)
+assign = signature.ThresholdAssignment(measure=loocd_res, cut_low=True, threshold=-0.05)
 assign_res = assign.assign()
 # This returns a boolean table, indicate for each feature which modules it has been assigned to
 ```
