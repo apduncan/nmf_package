@@ -3,12 +3,16 @@ Initially designed for use on """
 
 # Standard library imports
 from __future__ import annotations
+
+import itertools
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
 from functools import reduce
 import multiprocessing
 import random
 import time
-from typing import List, Tuple, Dict, Callable, Union, Optional, Any
+from typing import List, Tuple, Dict, Callable, Union, Optional, Iterable, NamedTuple
 import warnings
 
 # Dependency imports
@@ -26,67 +30,82 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import pairwise_distances, adjusted_rand_score
 from wNMF import wNMF
 
+import normalise
 # Local imports
 from mg_nmf.nmf import normalise as norm, synthdata as synthdata
 
 
-class NMFModelSelection(ABC):
-    """Abstract class to handle model selection. Subclasses should implement abstract methods for their criteria.
+class BetaLoss(Enum):
+    """Supported beta-loss functions."""
+    KULLBACK_LEIBLER: str = "kullback-leibler"
+    FROBENIUS: str = "frobenius"
+    ITAKURA_SAITO: str = "itakura-saito"
 
-    Public methods:
-    run                 -- run the model selection with specified parameters
-    list_solvers        -- provide a list of the supported solver methods
-    list_beta_loss      -- provide a list of the supported beta-loss functions
 
-    Instance variables:
-    nmf_max_iter: int   -- maximum number of iterations per nmf run, will terminate early if reaches convergence
-    k_min: int          -- value to start searching for k
-    k_max: int          -- value to end search for k
-    solver: str         -- nmf solver method
-    beta_loss: str      -- beta loss function
-    iterations: int     -- number of iterations to perform for each value of k
-    data: DataFrame    -- training data
-    normalise: function -- function to normalise data during model selection, provided in normalise module
-    normalise_arg: any  -- arguments to pass to normalise function
-    filter: function    -- function to filter data, to reduce model to only most significant features
-    filter_threshold: float
-                        -- argument for filter function, generally proportion of features to discard
-    metric: str         -- model selection metric(s) to generate, varies depending on concrete implementation
-    metrics: list[str]  -- list of the metrics available in this concrete implementation
-    """
+class Initialization(Enum):
+    """Supported W and H initialisation methods."""
+    RANDOM: str = "random"
+    NNSVD: str = "nnsvd"
+    NNSVDA: str = "nnsvda"
+    NNSVDAR: str = "nnsvdar"
 
-    ABS_K_MIN: int = 2
-    DEF_K_MIN: int = 2
-    DEF_K_MAX: int = 15
-    DEF_K_INTERVAL: int = 1
-    DEF_ITERATIONS: int = 50
+
+class Solver(Enum):
+    MULTIPLICATIVE_UPDATE: str = "mu"
+    COORDINATE_DESCENT: str = "cd"
+
+
+class NMFModel(NamedTuple):
+    """Filtering can lead to a model being fit on a subset of features. This class stores both the model, and
+    the features it was learned from, to allow refitting of data."""
+    feature_subset: List[str]
+    model: Union[NMF, wNMF]
+
+    def w(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Transform data using this model (get W matrix).
+
+        :param data: Data to transform. Must contain all features in feature subset.
+        :type data: pd.DataFrame
+
+        """
+
+        restrict_data: pd.DataFrame = data.loc[:, self.feature_subset]
+        w: np.ndarray = self.model.transform(restrict_data)
+        w_df: pd.DataFrame = pd.DataFrame(w)
+        w_df.index = data.index
+        w_df.columns = NMFDecomposer.component_names(self.model.n_components)
+        return w_df
+
+    @property
+    def h(self) -> pd.DataFrame:
+        """Get H matrix as DataFrame."""
+
+        return pd.DataFrame(
+            self.model.components_,
+            index=NMFDecomposer.component_names(self.model.n_components),
+            columns=self.feature_subset
+        )
+
+
+class NMFOptions:
+    """Hold all options offered for NMF decomposition in the package."""
+
     DEF_NMF_MAX_ITER = 1000
-    SOLVERS: List[str] = ['cd', 'mu']
-    BETA_LOSS: List[str] = ['frobenius', 'kullback-leibler', 'itakura-saito']
-    INIT: List[str] = ['random', 'nndsvd', 'nndsvda', 'nndsvdar']
 
-    def __init__(self, data: pd.DataFrame, k_min: int = None, k_max: int = None, k_interval: int = None,
-                 k_values: List[int] = None, solver: str = None, beta_loss: str = None, iterations: int = None,
-                 nmf_max_iter=None, normalise: Callable[[pd.DataFrame, float], pd.DataFrame] = None,
-                 normalise_arg: float = None, filter_fn=None, filter_threshold: float = None, metric: str = None) -> None:
-        """Intialise a model selection object ready to be run.
+    def __init__(self,
+                 solver: Solver = Solver.MULTIPLICATIVE_UPDATE,
+                 beta_loss: BetaLoss = BetaLoss.KULLBACK_LEIBLER,
+                 nmf_max_iter: int = None,
+                 normalise: Callable[[pd.DataFrame, float], pd.DataFrame] = None,
+                 normalise_arg: float = None,
+                 filter_fn: Callable[[pd.DataFrame, float], pd.DataFrame] = None,
+                 filter_threshold: float = None) -> None:
+        """Intialise NMF options object
 
-        :param data: training data
-        :type data: DataFrame
-        :param k_min: value to start searching k from
-        :type k_min: int
-        :param k_max:value to search k to
-        :type k_max: int
-        :param k_interval: interval between values of k, equivalent to range(1, 10, k)
-        :type k_interval: int
-        :param k_values: values of k to search. If None, will create a list from k_min, k_max, k_interval
-        :type k_values: List[str]
         :param solver: nmf solver method
-        :type solver: str
+        :type solver: Solver
         :param beta_loss: beta loss function
-        :type beta_loss: str
-        :param iterations: number of times to run for each value of k search
-        :type iterations: int
+        :type beta_loss: BetaLoss
         :param nmf_max_iter: maximum number of iterations for a single nmf run
         :type nmf_max_iter: int
         :param normalise: function to normalise data during training, from normalise module
@@ -97,25 +116,14 @@ class NMFModelSelection(ABC):
         :type filter_fn: function
         :param filter_threshold: argument to be passed to filter function, generally proportion of features to discard
         :type filter_threshold: float
-        :param metric: model selection metric(s) to produce
-        :type metric: str, list[str]
         """
-        self.k_min = k_min
-        self.k_max = k_max
-        self.k_interval = k_interval
-        self.k_values = k_values
         self.solver = solver
         self.beta_loss = beta_loss
-        self.iterations = iterations
         self.nmf_max_iter = nmf_max_iter
-        self.data = data
         self.normalise = normalise
         self.filter = filter_fn
         self.filter_threshold = filter_threshold
         self.normalise_arg = normalise_arg
-        self.nmf_class = NMF
-        self.metric = self.metrics[-1] if metric is None else metric
-        self.weighting = None
 
     @property
     def nmf_max_iter(self) -> int:
@@ -131,6 +139,426 @@ class NMFModelSelection(ABC):
             self.__nmf_max_iter: int = self.DEF_NMF_MAX_ITER
         else:
             self.__nmf_max_iter: int = nmf_max_iter
+
+    @property
+    def solver(self) -> Solver:
+        """Return solver type."""
+        return self.__solver
+
+    @solver.setter
+    def solver(self, solver: Solver) -> None:
+        """Set solver type."""
+        # Support providing enum or string value matching an enum value
+        if not isinstance(solver, Solver):
+            if str(solver) in Solver:
+                solver = Solver[str(solver)]
+            else:
+                raise Exception(f'Value {solver} for solver now allowed, must be one of {Solver}')
+        self.__solver: Solver = solver
+
+    @property
+    def beta_loss(self) -> BetaLoss:
+        """Return the beta loss function."""
+        return self.__beta_loss
+
+    @beta_loss.setter
+    def beta_loss(self, beta_loss: BetaLoss) -> None:
+        """Set the beta loss function."""
+        # Support providing enum or string value matching an enum value
+        if not isinstance(beta_loss, BetaLoss):
+            if beta_loss in BetaLoss:
+                beta_loss = BetaLoss[str(beta_loss)]
+            else:
+                raise Exception(f'Value {beta_loss} for solver now allowed, must be one of {BetaLoss}')
+        self.__beta_loss: BetaLoss = beta_loss
+
+
+    @property
+    def normalise(self) -> Callable[[pd.DataFrame, float], pd.DataFrame]:
+        """Function used to map each column of W to a value to normalise W & H by."""
+        return self.__normalise
+
+    @normalise.setter
+    def normalise(self, normalise: Callable[[pd.DataFrame, float], pd.DataFrame]) -> None:
+        """Function used to map each column of W to a value to normalise W & H by."""
+        self.__normalise = normalise
+
+    @property
+    def normalise_arg(self) -> float:
+        """Numerical argument to pass to normalisation function."""
+        return self.__normalise_arg
+
+    @normalise_arg.setter
+    def normalise_arg(self, normalise_arg: float) -> None:
+        """Numerical argument to pass to normalisation function."""
+        self.__normalise_arg: float = normalise_arg
+
+    @property
+    def filter(self) -> Callable[[pd.DataFrame, float], pd.DataFrame]:
+        return self.__filter
+
+    @filter.setter
+    def filter(self, filter_fn: Callable[[pd.DataFrame, float], pd.DataFrame]) -> None:
+        self.__filter = filter_fn
+
+    @property
+    def filter_threshold(self) -> float:
+        return self.__filter_threshold
+
+    @filter_threshold.setter
+    def filter_threshold(self, filter_threshold: float) -> None:
+        self.__filter_threshold: float = filter_threshold
+
+    @classmethod
+    def from_options(cls, options: NMFOptions) -> NMFOptions:
+        """Copy constructor
+
+        :param options: Object to copy
+        :type options: NMFOptions
+        :return: Copied object
+        :rtype: NMFOptions
+        """
+        return NMFOptions(
+            solver=options.solver,
+            beta_loss=options.beta_loss,
+            nmf_max_iter=options.nmf_max_iter,
+            normalise=options.normalise,
+            normalise_arg=options.normalise_arg,
+            filter_fn=options.filter,
+            filter_threshold=options.filter_threshold
+        )
+
+    def __repr__(self):
+        vals: str = ", ".join(
+            filter(lambda x: x is not None,
+                [f'solver={self.solver.value}',
+                 f'beta_loss={self.beta_loss.value}'
+                 f'nmf_max_iter={self.__nmf_max_iter}',
+                 f'normalise={self.normalise}' if self.normalise is not None else None,
+                 f'normalise_args={self.normalise_arg}' if self.normalise_arg is not None else None,
+                 f'filter={self.filter}' if self.filter is not None else None,
+                 f'filter_arg={self.filter_threshold}' if self.filter_threshold is not None else None]
+            )
+        )
+        return f'NMFOptions({vals})'
+
+
+class NMFDecomposer:
+    """Perform decompositions for a given matrix, and keep the results. Results are held in memory, and if n
+    decompositions are requested, and p had been previously run, max(n-p, 0) new decompositions will be run and
+    returned along with the prior decompositions. This behaviour can be disabled with the cache parameters.
+
+    Some of the rank selection methods implemented are derived from multiple decompositions, so it is more
+    computationally efficient to perform these decompositions once and calculate measures on all of them. This class
+    is intended to transparently handle this, rather than having to externally make a dict of decompositions and
+    feed them into the rank selection classes.
+    """
+
+    MAX_RAND_INT: int = 214748264
+
+    @dataclass
+    class RankCache:
+        """Want to ensure reproducible results, regardless of which order decompositions are requested in. Each rank
+        will have separate random number generator used to get seeds for the n-th decomposition of a rank. The seed
+        for the rank generator is the decomposer seed + rank. Uncached results do not use these random number genrators
+        and instead use the default random methods."""
+        seed_generator: random.Random
+        decompositions: List[NMFModel]
+
+    def __init__(self, data: pd.DataFrame, options: NMFOptions = NMFOptions(), cache: bool = True,
+                 processes: int = 1, seed: int = None) -> None:
+        """Initialise decomposer. All properties other than processes are read-only, cannot be altered after
+        initialisation to ensure cache results consistent with parameters."""
+        self.__data: pd.DataFrame = data
+        self.__options: NMFOptions = options
+        self.__cache: bool = False
+        self.__decompositions: Dict[int, NMFDecomposer.RankCache] = dict()
+        self.__seed: int = seed if seed is not None else random.randint(0, self.MAX_RAND_INT)
+        self.__seed_generators: Dict[int, random.Random] = dict()
+        self.__cache = cache
+        self.processes = processes
+        self._data_warn()
+
+    @property
+    def data(self) -> pd.DataFrame:
+        """Return the X matrix being decomposed."""
+        # Copy for full encapsulatioon
+        return self.__data.copy()
+
+    @property
+    def options(self) -> NMFOptions:
+        return self.__options
+
+    @property
+    def cache(self) -> bool:
+        return self.__cache
+
+    @property
+    def seed(self) -> int:
+        return self.__seed
+
+    @property
+    def processes(self) -> int:
+        return self.__processes
+
+    @processes.setter
+    def processes(self, processes: int) -> None:
+        if processes < 1:
+            processes = 1
+        self.__processes: int = processes
+
+    def _fetch_from_cache(self, rank: int, n: int) -> List[NMFModel]:
+        """Get as many of n decompositions for rank as possible from the cache.
+
+        :param rank: Number of modules in decomposition
+        :type rank: int
+        :param n: Number of decompositions
+        :type n: int
+        :return: List of decompositions, potentially empty
+        :rtype: List[NMFModel]
+        """
+
+        if rank not in self.__decompositions:
+            self.__decompositions[rank] = NMFDecomposer.RankCache(random.Random(self.seed + rank), list())
+        return list(itertools.islice(self.__decompositions[rank].decompositions, n))
+
+    def _data_warn(self) -> None:
+        """Provide warning if it appears that data may be in incorrect orientation.
+        NMF literature describes X as a matrix with samples on columns, and features on rows. However, sk-learn
+        has this transposed, which is important for fitting new samples. Want to detect if input data is provided in
+        what is likely the wrong orientation. This is detected based on number of samples being larger than number of
+        features; we would generally expect in meta-omic data that number of features >> number samples."""
+        if self.data is not None:
+            rows, cols = self.data.shape
+            if rows > cols:
+                warnings.warn('Data orientation may be incorrect. Input matrix X should have features on columns, ' 
+                              'samples on rows. sk-learn orientation is transposed from majority of NMF literature.')
+
+    @staticmethod
+    def component_names(rank: int) -> List[str]:
+        """Names for components in result dataframes
+
+        :param rank: Number of components
+        :type rank: int
+        :return: List of component names
+        :rtpye: List[str]
+        """
+
+        return [f'm{x}' for x in range(1, rank + 1)]
+
+    def decompose(self, rank: int, n: int, cached: bool = True) -> List[NMFModel]:
+        """Get n decompositions for rank k, by default returning the cached results.
+
+        :param rank: Number of modules in decomposition
+        :type rank: int
+        :param n: Number of decompositions
+        :type n: int
+        :param cached: Use the result cache for this request
+        :type cached: bool
+        :return: A list of n NMF decompositions
+        :rtype: List[NMF]
+        """
+
+        from_cache: List[NMFModel] = self._fetch_from_cache(rank, n) if self.cache and cached else []
+        needed: int = n - len(from_cache)
+
+        if needed == 0:
+            return from_cache
+
+        # Construct a list of arguments for the call to _run_for_k
+        random_state: random.Random = (self.__decompositions[rank].seed_generator if not cached or not self.__cache
+                                       else random)
+        args: Iterable[Tuple[int, int]] = (
+            (rank, self.__decompositions[rank].seed_generator.randint(0, self.MAX_RAND_INT)) for _ in range(needed)
+        )
+
+        # Run the required number of times
+        new: List[NMFModel]
+        if self.processes > 1:
+            with multiprocessing.Pool(processes=self.processes) as pool:
+                new = pool.starmap(self._run_for_k, args)
+        else:
+            new = [self._run_for_k(*x) for x in args]
+
+        # Add new to cache
+        if cached:
+            self.__decompositions[rank].decompositions += new
+
+        return from_cache + new
+
+    def filter(self, model: NMFModel) -> pd.DataFrame:
+        """Reduce the H matrix of a model to only the more informative features, using given filter and
+        normalisation functions defined in NMFOptions. This method only filters, does not relearn the model based only
+        on these features.
+
+        :param model: NMF model to be filtered
+        :type model: NMF
+        :return: Reduced W matrix
+        :rtype: pd.DataFrame
+        """
+
+        h: pd.DataFrame = model.h
+        components: List[str] = list(h.index)
+        if self.options.filter is not None:
+            h_norm: pd.DataFrame = h
+            if self.options.normalise is not None:
+                h_norm: pd.DataFrame = norm.normalise(
+                    self.options.normalise(h, self.options.normalise_arg), None, h)[1]
+            # Filter
+            u: pd.DataFrame = self.options.filter(h_norm, self.options.filter_threshold)
+            # Reduce H to the restricted list
+            h = h.loc[:,list(u.columns)]
+        h.index.name = "modules"
+        return h
+
+    def normalise(self, model: NMFModel, w: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Normalise W and H matrices of decomposition using the given normalisation methods provided in NMFOptions.
+
+        :param model: NMF model to be normalised
+        :type model: NMF
+        :param w: Reduced W matrix to use in normalising; if not provided, uses full matrix
+        :type w: pd.DataFrame
+        :return: Normalised W and H matrices
+        :rtype: Tuple[pd.DataFrame, pd.DataFrame]
+        """
+
+        h = model.h
+        components: List[str] = list(h.index)
+        if w is None:
+            w = model.w(self.data)
+        if self.options.normalise is not None:
+            w, h = norm.normalise(
+                self.options.normalise(h, self.options.normalise_arg), w, h)
+        w_res: pd.DataFrame = w
+        w.columns = components
+        w_res.index.name = 'samples'
+        h_res: pd.DataFrame = pd.DataFrame(data=h, index=components,
+                                           columns=self.data.columns)
+        h_res.index.name = 'modules'
+
+        return w_res, h_res
+
+    def _run_for_k(self, k: int, seed: int) -> NMFModel:
+        """Create models and assess stability for k components.
+
+        :param k: number of modules to identify
+        :type k: int
+        :param seed: random seed
+        :type seed: int
+        :return: reduced dimension model
+        :rtype: NMFModel
+        """
+        start_time = time.time()
+        start_time_text = time.strftime("%X")
+        # Create a model with our parameters for this value of k
+        # try:
+        feature_subset: List[str] = list(self.data.columns)
+        model = NMF(n_components=k,
+                    solver=self.options.solver.value,
+                    beta_loss=self.options.beta_loss.value,
+                    init=Initialization.RANDOM.value,
+                    random_state=seed,
+                    max_iter=self.options.nmf_max_iter)
+        w = model.fit_transform(self.data)
+        if self.options.filter is not None:
+            # Normalise, filter source data, rerun on reduced data
+            u: pd.DataFrame = self.filter(NMFModel(list(self.data.columns), model))
+            feature_subset: List[str] = list(u.columns)
+            # Restrict source data to these indices
+            reduced: pd.DataFrame = self.data.loc[:, feature_subset]
+            # Rerun NMF and return model
+            reduced_model = NMF(n_components=k,
+                                solver=self.options.solver.value,
+                                beta_loss=self.options.beta_loss.value,
+                                init='random',
+                                random_state=seed,
+                                max_iter=self.options.nmf_max_iter)
+            # Fit model to reduced data - don't need the returned W matrix
+            _ = reduced_model.fit_transform(reduced)
+            model = reduced_model
+        duration = time.time() - start_time
+        print(f'[{time.strftime("%X")} - {start_time_text}] [k={k}] Ran, took {duration} seconds')
+        return NMFModel(feature_subset, model)
+        # except Exception as err:
+        #     print(err)
+
+    def for_data(self, data: pd.DataFrame) -> NMFDecomposer:
+        """Create an object with the same settings but for different data, with empty cache.
+
+        :param data: Data to be decomposed
+        :type data: pd.DataFrame
+        :return: Decomposer for the new data, with empty cache
+        :rtype: NMFDecomposer
+        """
+        return NMFDecomposer(data=data, options=self.options, cache=self.cache, processes=self.processes,
+                             seed=self.seed)
+
+    def __repr__(self):
+        return (f'NMFDecomposer(id={id(self)} | data={id(self.data)}, cache={self.cache}, processes={self.processes}, '
+                f'seed={self.seed})')
+
+
+class NMFModelSelection(ABC):
+    """Abstract class to handle model selection. Subclasses should implement abstract methods for their criteria.
+
+    Public methods:
+    run                 -- run the model selection with specified parameters
+    list_solvers        -- provide a list of the supported solver methods
+    list_beta_loss      -- provide a list of the supported beta-loss functions
+
+    Instance variables:
+    decomposter:        --  decomposer object to perform decompositions
+        NMFDecomposer
+    k_min: int          -- value to start searching for k
+    k_max: int          -- value to end search for k
+    k_interval: int     -- interval between values of k to search (i.e. interval 2 = 2, 4, 6 ...)
+    k_values: List[int] -- specific values of k to search. k_min, k_max, k_interval ignored if this is provided
+    iterations: int     -- number of iterations to perform for each value of k
+    metric: str         -- model selection metric(s) to generate, varies depending on concrete implementation
+    metrics: list[str]  -- list of the metrics available in this concrete implementation
+    """
+
+    ABS_K_MIN: int = 2
+    DEF_K_MIN: int = 2
+    DEF_K_MAX: int = 15
+    DEF_K_INTERVAL: int = 1
+    DEF_ITERATIONS: int = 50
+    DEF_NMF_MAX_ITER = 1000
+    SOLVERS: List[str] = ['cd', 'mu']
+    BETA_LOSS: List[str] = ['frobenius', 'kullback-leibler', 'itakura-saito']
+    INIT: List[str] = ['random', 'nndsvd', 'nndsvda', 'nndsvdar']
+
+    def __init__(self,
+                 decomposer: NMFDecomposer,
+                 k_min: int = None,
+                 k_max: int = None,
+                 k_interval: int = None,
+                 k_values: List[int] = None,
+                 iterations: int = None,
+                 metric: str = None) -> None:
+        """Intialise a model selection object ready to be run.
+
+        :param decomposer: Object to perform decomposition (contains the data)
+        :type decomposer: NMFDecomposer
+        :param k_min: value to start searching k from
+        :type k_min: int
+        :param k_max:value to search k to
+        :type k_max: int
+        :param k_interval: interval between values of k, equivalent to range(1, 10, k)
+        :type k_interval: int
+        :param k_values: values of k to search. If None, will create a list from k_min, k_max, k_interval
+        :type k_values: List[str]
+        :param metric: model selection metric(s) to produce
+        :type metric: str, list[str]
+        """
+        self.k_min = k_min
+        self.k_max = k_max
+        self.k_interval = k_interval
+        self.k_values = k_values
+        self.metric = self.metrics[-1] if metric is None else metric
+        self.weighting = None
+        self.__decomposer: NMFDecomposer = decomposer
+        self.iterations = iterations
 
     @property
     def k_min(self) -> int:
@@ -187,97 +615,6 @@ class NMFModelSelection(ABC):
         return list(range(self.k_min, self.k_max+1, self.k_interval))
 
     @property
-    def solver(self) -> str:
-        """Return solver type."""
-        return self.__solver
-
-    @solver.setter
-    def solver(self, solver) -> None:
-        """Set solver type."""
-        if solver not in self.SOLVERS:
-            raise Exception(f'Value {solver} for solver now allowed, must be one of {self.SOLVERS}')
-        self.__solver = solver
-
-    def list_solvers(self) -> List[str]:
-        """Return a list of all the solvers."""
-        return self.SOLVERS
-
-    @property
-    def beta_loss(self) -> str:
-        """Return the beta loss function."""
-        return self.__beta_loss
-
-    @beta_loss.setter
-    def beta_loss(self, beta_loss: str) -> None:
-        """Set the beta loss function."""
-        if beta_loss is None or beta_loss not in self.BETA_LOSS:
-            raise Exception(f'Value {beta_loss} for solver now allowed, must be one of {self.BETA_LOSS}')
-        self.__beta_loss: str = beta_loss
-
-    def list_beta_loss(self) -> List[str]:
-        """Return a list of all beta loss functions."""
-        return self.BETA_LOSS
-
-    @property
-    def iterations(self) -> int:
-        """Return number of iterations per k during model selection."""
-        return self.__iterations
-
-    @iterations.setter
-    def iterations(self, iterations: int) -> None:
-        """Set number of iterations per k during model selection."""
-        if iterations is None:
-            iterations = 1
-        self.__iterations: int = max(iterations, 1)
-
-    @property
-    def data(self) -> pd.DataFrame:
-        """Return the data the model is being trained on."""
-        return self.__data
-
-    @data.setter
-    def data(self, data: pd.DataFrame) -> None:
-        """Set the data to train on."""
-        self.__data = data
-        self._data_warn()
-
-    @property
-    def normalise(self) -> Callable[[pd.DataFrame, float], pd.DataFrame]:
-        """Function used to map each column of W to a value to normalise W & H by."""
-        return self.__normalise
-
-    @normalise.setter
-    def normalise(self, normalise: Callable[[pd.DataFrame, float], pd.DataFrame]) -> None:
-        """Function used to map each column of W to a value to normalise W & H by."""
-        self.__normalise = normalise
-
-    @property
-    def normalise_arg(self) -> float:
-        """Numerical argument to pass to normalisation function."""
-        return self.__normalise_arg
-
-    @normalise_arg.setter
-    def normalise_arg(self, normalise_arg: float) -> None:
-        """Numerical argument to pass to normalisation function."""
-        self.__normalise_arg: float = normalise_arg
-
-    @property
-    def filter(self) -> Callable[[pd.DataFrame, float], pd.DataFrame]:
-        return self.__filter
-
-    @filter.setter
-    def filter(self, filter_fn: Callable[[pd.DataFrame, float], pd.DataFrame]) -> None:
-        self.__filter = filter_fn
-
-    @property
-    def filter_threshold(self) -> float:
-        return self.__filter_threshold
-
-    @filter_threshold.setter
-    def filter_threshold(self, filter_threshold: float) -> None:
-        self.__filter_threshold: float = filter_threshold
-
-    @property
     def metric(self):
         return self.metrics[-1] if self.__metric is None else self.__metric
 
@@ -286,6 +623,20 @@ class NMFModelSelection(ABC):
         if metric not in self.metrics:
             raise Exception(f'Value {metric} for metric not allowed, must be one of {self.metrics}')
         self.__metric: str = metric
+
+    @property
+    def iterations(self) -> int:
+        return self.__iterations
+
+    @iterations.setter
+    def iterations(self, iterations: int) -> None:
+        if iterations is None:
+            iterations = 1
+        self.__iterations: int = max(iterations, 1)
+
+    @property
+    def decomposer(self) -> NMFDecomposer:
+        return self.__decomposer
 
     @property
     @abstractmethod
@@ -297,63 +648,6 @@ class NMFModelSelection(ABC):
     def run(self, processes: int = 1) -> NMFResults:
         """Run process for model selection of NMF."""
         pass
-
-    def _data_warn(self) -> None:
-        """Provide warning if it appears that data may be in incorrect orientation.
-        NMF literature describes X as a matrix with samples on columns, and features on rows. However, sk-learn
-        has this transposed, which is important for fitting new samples. Want to detect if input data is provided in
-        what is likely the wrong orientation. This is detected based on number of samples being larger than number of
-        features; we would generally expect in meta-omic data that number of features >> number samples."""
-        if self.data is not None:
-            rows, cols = self.data.shape
-            if rows > cols:
-                warnings.warn('Data orientation may be incorrect. Input matrix X should have features on columns, ' 
-                              'samples on rows. sk-learn orientation is transposed from majority of NMF literature.')
-
-    def _run_for_k_single(self, k: int, data: pd.DataFrame = None) -> NMF:
-        """Create models and assess stability for k components.
-
-        :param k: number of components to identify
-        :type k: int
-        :param data: data to learn model from
-        :type data: DataFrame
-        :return: reduced dimension model
-        :rtype: NMF
-        """
-        start_time = time.time()
-        start_time_text = time.strftime("%X")
-        # Create a model with our parameters for this value of k
-        try:
-            if data is None:
-                data = self.data
-            model = NMF(n_components=k, solver=self.solver,
-                        beta_loss=self.beta_loss, init='random', random_state=None,
-                        max_iter=self.nmf_max_iter)
-            w = model.fit_transform(data)
-            if self.filter is not None:
-                # Normalise, filter source data, rerun on reduced data
-                w: pd.DataFrame = w
-                if self.normalise is not None:
-                    w = norm.normalise(self.normalise(w, self.normalise_arg), w, None)[0]
-                # Convert to a dataframe with correct indexing
-                w = pd.DataFrame(data=w, index=data.index,
-                                 columns=[f'm{x}' for x in range(1, k + 1)])
-                w.index.name = 'samples'
-                u: pd.DataFrame = self.filter(w, self.filter_threshold)
-                # Restrict source data to these indices
-                reduced: pd.DataFrame = data.loc[u.index]
-                # Rerun NMF and return model
-                reduced_model = NMF(n_components=k, solver=self.solver,
-                                    beta_loss=self.beta_loss, init='random', random_state=None,
-                                    max_iter=self.nmf_max_iter)
-                # Fit model to reduced data - don't need the returned W matrix
-                _ = reduced_model.fit_transform(reduced)
-                model = reduced_model
-            duration = time.time() - start_time
-            print(f'[{time.strftime("%X")} - {start_time_text}] [k={k}] Ran, took {duration} seconds')
-            return model
-        except Exception as err:
-            print(err)
 
 
 # noinspection SpellCheckingInspection
@@ -375,19 +669,10 @@ class NMFConsensusSelection(NMFModelSelection):
         :return: results of tuples of model selection metrics, first is cophenetic correlation, second dispersion
         :rtype: (NMFResults, NMFResults), or NMFResults
         """
-        i: int
-        multiproc_args: List[int] = []
-        for i in self.k_values:
-            multiproc_args += [i] * self.iterations
-        # Try without multiprocessing
-        with multiprocessing.Pool(processes) as pool:
-            models: List[NMF] = list(map(self._run_for_k_single, multiproc_args))
-            pool.close()
-        results: List[Tuple[NMFModelSelectionResults, NMFModelSelectionResults]] = []
-        print(f'[{time.strftime("%X")}] ITERATIONS COMPLETE, AGGREGATING RESULTS')
+        results: List[Tuple[NMFModelSelectionResults, NMFModelSelectionResults]] = list()
         for i in self.k_values:
             print(f'[{time.strftime("%X")}] AGGREGATE {i}')
-            kmodels: List[NMF] = [x for x in models if x.n_components == i]
+            kmodels: List[NMFModel] = self.decomposer.decompose(i, self.iterations)
             kresults: Tuple[NMFModelSelectionResults, NMFModelSelectionResults] = self._results_for_k(i, kmodels)
             results.append(kresults)
         print(f'[{time.strftime("%X")}] AGGREGATION COMPLETE')
@@ -395,16 +680,16 @@ class NMFConsensusSelection(NMFModelSelection):
         coph_res: List[NMFModelSelectionResults] = [x[0] for x in results]
         disp_res: List[NMFModelSelectionResults] = [x[1] for x in results]
         if self.metric == 'cophenetic':
-            return NMFResults(coph_res, self.data)
+            return NMFResults(coph_res, self.decomposer.data)
         if self.metric == 'dispersion':
-            return NMFResults(disp_res, self.data)
+            return NMFResults(disp_res, self.decomposer.data)
         return (
-            NMFResults(coph_res, self.data),
-            NMFResults(disp_res, self.data)
+            NMFResults(coph_res, self.decomposer.data),
+            NMFResults(disp_res, self.decomposer.data)
         )
 
     @staticmethod
-    def _create_connectivity_matrix(model_selection: Tuple[NMF, NMFConsensusSelection]) -> ConnectivityMatrix:
+    def _create_connectivity_matrix(model_selection: Tuple[NMFModel, NMFConsensusSelection]) -> ConnectivityMatrix:
         """Return a connectivity matrix for a model. Intended to be used in multiprocessing.
 
         :param model_selection: pair of a learnt model, and the object which learnt it
@@ -414,13 +699,13 @@ class NMFConsensusSelection(NMFModelSelection):
         """
 
         model, selector = model_selection
-        w = model.transform(selector.data)
-        h = model.components_
-        if selector.normalise is not None:
-            w, h = norm.normalise(selector.normalise(w, selector.normalise_arg), w, h)
-        return ConnectivityMatrix(w)
+        w, h = selector.decomposer.normalise(model)
+        return ConnectivityMatrix(w.values)
 
-    def _results_for_k(self, k: int, models: List[NMF]) -> Tuple[NMFModelSelectionResults, NMFModelSelectionResults]:
+    def _results_for_k(self,
+                       k: int,
+                       models: List[NMFModel]
+                       ) -> Tuple[NMFModelSelectionResults, NMFModelSelectionResults]:
         """Create models and assess cophenetic correlation and dispersion for k components.
 
         :param k: number of components in the learnt models
@@ -433,47 +718,27 @@ class NMFConsensusSelection(NMFModelSelection):
         i: int
         c_matrices: List[ConnectivityMatrix]
         # Find best model, normalise if required
-        best_model: NMF = min(models, key=lambda x: x.reconstruction_err_)
-        model_args: List[Tuple[NMF, NMFConsensusSelection]] = [(x, self) for x in models]
-        tfrom = time.time()
-        with multiprocessing.Pool() as pool:
+        best_model: NMFModel = min(models, key=lambda x: x.model.reconstruction_err_)
+        model_args: List[Tuple[NMFModel, NMFConsensusSelection]] = [(x, self) for x in models]
+        with multiprocessing.Pool(self.decomposer.processes) as pool:
             c_matrices = list(map(self._create_connectivity_matrix, model_args))
             pool.close()
         c_bar: pd.DataFrame = ConnectivityMatrix.c_bar(c_matrices)
-        tfrom = time.time()
         # Find cophenetic correlation value
         c, co_distt = ConnectivityMatrix.cophenetic_corr(c_bar)
         # Find dispersion
         dispersion: float = ConnectivityMatrix.dispersion(c_bar)
         # Make dataframes out of w and h with lowest error
-        components = [f'c{x}' for x in range(1, k + 1)]
-        w = best_model.transform(self.data)
-        w = pd.DataFrame(w, index=self.data.index, columns=components)
-        if self.filter is not None:
-            w_norm: pd.DataFrame = w
-            if self.normalise is not None:
-                w_norm: pd.DataFrame = norm.normalise(self.normalise(w, self.normalise_arg), w, None)[0]
-            # Convert to df with correct indexing
-            w_norm.columns = components
-            w_norm.index.name = 'samples'
-            # Filter
-            u: pd.DataFrame = self.filter(w_norm, self.filter_threshold)
-            # Reduce W to the restricted list
-            w = w.loc[u.index]
-        h = best_model.components_
-        if self.normalise is not None:
-            w, h = norm.normalise(self.normalise(w, self.normalise_arg), w, h)
-        w_res: pd.DataFrame = pd.DataFrame(data=w.values, index=w.index,
-                                           columns=components)
-        w_res.index.name = 'samples'
-        h_res: pd.DataFrame = pd.DataFrame(data=h, index=components,
-                                           columns=self.data.columns)
-        h_res.index.name = 'modules'
+        w: pd.DataFrame = best_model.w(self.decomposer.data)
+        w, h = self.decomposer.normalise(best_model, w)
         return (
-            NMFModelSelectionResults(k, c, c_bar, w_res, h_res, best_model, self.data),
-            NMFModelSelectionResults(k, dispersion, c_bar, w_res, h_res, best_model, self.data)
+            NMFModelSelectionResults(k, c, c_bar, w, h, best_model, self.decomposer.data),
+            NMFModelSelectionResults(k, dispersion, c_bar, w, h, best_model, self.decomposer.data)
         )
 
+    def __repr__(self):
+        return (f'NMFConsensusSelection(k_values={self.k_values}, iterations={self.iterations}, metric={self.metric}, '
+                f'decomposer={id(self.decomposer)})')
 
 # noinspection SpellCheckingInspection
 class NMFConcordanceSelection(NMFModelSelection):
@@ -495,23 +760,15 @@ class NMFConcordanceSelection(NMFModelSelection):
         :return: model selection results
         :rtype: NMFResults
         """
-        i: int
-        multiproc_args: List[int] = []
-        for i in self.k_values:
-            multiproc_args += [i] * self.iterations
-        with multiprocessing.Pool(processes) as pool:
-            models: List[NMF] = pool.map(self._run_for_k_single, multiproc_args)
-            pool.close()
-        results: List[NMFModelSelectionResults] = []
-        print(f'[{time.strftime("%X")}] ITERATIONS COMPLETE, AGGREGATING RESULTS')
+        results: List[NMFModelSelectionResults] = list()
         for i in self.k_values:
             print(f'[{time.strftime("%X")}] AGGREGATE {i}')
-            kmodels: List[NMF] = [x for x in models if x.n_components == i]
+            kmodels: List[NMFModel] = self.decomposer.decompose(rank=i, n=self.iterations)
             kresults: NMFModelSelectionResults = self._results_for_k(i, kmodels)
             results.append(kresults)
         print(f'[{time.strftime("%X")}] AGGREGATION COMPLETE')
         # Process all the different runs for a value of k
-        return NMFResults(results, self.data)
+        return NMFResults(results, self.decomposer.data)
 
     @staticmethod
     def _extract_tril(a: np.ndarray) -> np.ndarray:
@@ -523,7 +780,7 @@ class NMFConcordanceSelection(NMFModelSelection):
             extract += a_list[i][:i]
         return extract
 
-    def _results_for_k(self, k: int, models: List[NMF]) -> NMFModelSelectionResults:
+    def _results_for_k(self, k: int, models: List[NMFModel]) -> NMFModelSelectionResults:
         """Create models and assess stability for k components.
 
         :param k: number of components in models
@@ -534,33 +791,29 @@ class NMFConcordanceSelection(NMFModelSelection):
         :rtype: NMFModelSelectionResults
         """
 
-        # The paper states that similarity matrix S is calculate from 'sample projection' matrix H
+        # The paper states that similarity matrix S is calculates from 'sample projection' matrix H
         # Due to transposition of data in sklearn implementation, our sample matrix is actually W, and sould be
         # calculated from this instead.
-        # Select model with lowest reconstruction error
-        best_model: NMF = min(models, key=lambda p: p.reconstruction_err_)
-        best_W = best_model.transform(self.data)
-        best_H = best_model.components_
-        if self.normalise is not None:
-            best_W, best_H = norm.normalise(self.normalise(best_W, self.normalise_arg), best_W, best_H)
+
+        # Select model with the lowest reconstruction error
+        best_model: NMFModel = min(models, key=lambda p: p.model.reconstruction_err_)
+        best_W = best_model.w(self.decomposer.data)
+        best_W, best_H = self.decomposer.normalise(best_model, best_W)
         # best_H_enorm: np.ndarray = np.linalg.norm(best_H, axis=0)
         # best_H_bar: pd.DataFrame = (best_H.T / best_H_enorm[:, None]).T
         # best_S: pd.DataFrame = best_H_bar.T.dot(best_H_bar)
         # Reshape to modules on rows, samples on columns
-        bW_reshape: np.ndarray = best_W.T
+        bW_reshape: np.ndarray = best_W.T.values
         best_W_enorm: np.ndarray = np.linalg.norm(bW_reshape, axis=0)
         best_W_bar: pd.DataFrame = (bW_reshape / best_W_enorm)
         best_S: pd.DataFrame = best_W_bar.T.dot(best_W_bar)
         diffs: List[float] = []
         for model in models:
-            # Skip if this model is the one which had lowest reconstruction error
+            # Skip if this model is the one which had the lowest reconstruction error
             if model is best_model:
                 continue
-            w_model = model.transform(self.data)
-            h_model = model.components_
-            # Normalise H
-            if self.normalise is not None:
-                w_model, h_model = norm.normalise(self.normalise(w_model, self.normalise_arg), w_model, h_model)
+            w_model = model.w(self.decomposer.data)
+            w_model, h_model = self.decomposer.normalise(model, w_model)
             # Derive similarity matrix for this iteration
             w_reshape = w_model.T
             w_enorm = np.linalg.norm(w_reshape, axis=0)
@@ -568,34 +821,13 @@ class NMFConcordanceSelection(NMFModelSelection):
             # Convert to similarity
             s: pd.DataFrame = w_bar.T.dot(w_bar)
             # Get D - difference between selected model and this
-            d: pd.DataFrame = best_S - s
+            d: np.ndarray = best_S - s
             d_ltri = self._extract_tril(np.square(d))
             diffs += d_ltri
         # Find mean of squared difference between best_S and S_j
         # ci = 1 - np.median(diffs)
         ci = 1 - np.mean(diffs)
-        # Make dataframes out of w and h with lowest error
-        components = [f'c{x}' for x in range(1, k + 1)]
-        w_model = pd.DataFrame(best_W, index=self.data.index, columns=components)
-        if self.filter is not None:
-            w_norm: pd.DataFrame = w_model
-            if self.normalise is not None:
-                w_norm: pd.DataFrame = norm.normalise(self.normalise(w_model, self.normalise_arg), w_model, None)[0]
-            # Convert to df with correct indexing
-            w_norm.columns = components
-            w_norm.index.name = 'samples'
-            # Filter
-            u: pd.DataFrame = self.filter(w_norm, self.filter_threshold)
-            # Reduce W to the restricted list
-            w_model = w_model.loc[u.index]
-        h_model = best_H
-        w: pd.DataFrame = pd.DataFrame(data=w_model.values, index=w_model.index,
-                                       columns=components)
-        w.index.name = 'samples'
-        h: pd.DataFrame = pd.DataFrame(data=h_model, index=components,
-                                       columns=self.data.columns)
-        h.index.name = 'modules'
-        return NMFModelSelectionResults(k, ci, None, w, h, best_model, self.data)
+        return NMFModelSelectionResults(k, ci, None, best_W, best_H, best_model, self.decomposer.data)
 
 
 # noinspection SpellCheckingInspection
@@ -1202,11 +1434,13 @@ class NMFModelSelectionResults:
     data: DataFrame     -- data this model was built from
     """
 
-    def __init__(self, k: int, cophenetic_corr: float,
-                 connectivity: Optional[ConnectivityMatrix],
+    def __init__(self,
+                 k: int,
+                 cophenetic_corr: float,
+                 connectivity: Optional[pd.DataFrame],
                  w: Optional[pd.DataFrame],
                  h: Optional[pd.DataFrame],
-                 model: Optional[Union[NMF, wNMF]],
+                 model: Optional[NMFModel],
                  data: pd.DataFrame) -> None:
         """Create for NMFModelResults.
 
@@ -1229,10 +1463,10 @@ class NMFModelSelectionResults:
         """
         self.__k: int = k
         self.__metric: float = cophenetic_corr
-        self.__connectivity: ConnectivityMatrix = connectivity
+        self.__connectivity: pd.DataFrame = connectivity
         self.__w: pd.DataFrame = w
         self.__h: pd.DataFrame = h
-        self.__model: NMF = model
+        self.__model: Optional[NMFModel] = model
         self.__data: pd.DataFrame = data
         self.__name_dfs()
 
@@ -1247,7 +1481,7 @@ class NMFModelSelectionResults:
         return self.__metric
 
     @property
-    def connectivity(self) -> ConnectivityMatrix:
+    def connectivity(self) -> pd.DataFrame:
         """Return average connectivity matrix for this k."""
         return self.__connectivity
 
@@ -1262,7 +1496,7 @@ class NMFModelSelectionResults:
         return self.__w
 
     @property
-    def model(self) -> NMF:
+    def model(self) -> NMFModel:
         """Return the fitted NMF model."""
         return self.__model
 
@@ -1283,12 +1517,12 @@ class NMFModelSelectionResults:
         """Give the indices W, H the correct names."""
         # W
         if self.__w is not None:
-            self.__w.columns = [f'm{i}' for i in range(1, len(self.__w.columns)+1)]
+            self.__w.columns = NMFDecomposer.component_names(self.k)
             self.__w.columns.name = 'modules'
             self.__w.index.name = self.__data.index.name
         # H
         if self.__h is not None:
-            self.__h.index = [f'm{i}' for i in range(1, len(self.__h.index) + 1)]
+            self.__h.index = NMFDecomposer.component_names(self.k)
             self.__h.index.name = 'modules'
             self.__h.columns.name = self.__data.columns.name
 
@@ -1542,30 +1776,57 @@ def tests() -> None:
 
 def orientation_tests():
     # Make some synthetic data to play with
-    data: pd.DataFrame = synthdata.sparse_overlap_even(rank=4, m_overlap=0, n_overlap=0,
-                                                     size=(300, 48), noise=(0,1), p_ubiq=0.1, feature_scale=True)
+    data: pd.DataFrame = synthdata.sparse_overlap_even(rank=12, m_overlap=0.3, n_overlap=0.3,
+                                                     size=(2000, 100), noise=(0,4), p_ubiq=0.0, feature_scale=True)
     # Transpose to sk-learn orientation
     data = data.T
-    # sns.heatmap(data)
     # plt.show()
-    sel: NMFModelSelection = NMFConsensusSelection(data, k_values=[2,6], solver='mu', beta_loss='kullback-leibler',
-                                               iterations=10)
-    res = sel.run()
+    # sel: NMFModelSelection = NMFConsensusSelection(data, k_values=[2,6], solver='mu', beta_loss='kullback-leibler',
+    #                                            iterations=10)
+    opts = NMFOptions(
+        nmf_max_iter=3000,
+        filter_fn=normalise.variance_filter,
+        filter_threshold=0.5,
+        normalise=normalise.map_maximum,
+        normalise_arg=None
+    )
+    decomposer = NMFDecomposer(
+        data=data,
+        options=opts,
+        seed=7297108
+    )
+    sel: NMFModelSelection = NMFConcordanceSelection(
+        k_values=[9,10,11,12,13,14,15,16], iterations=5, decomposer=decomposer
+    )
+    sel2: NMFModelSelection = NMFConsensusSelection(
+        k_values=[9,10,11,12,13,14,15,16], iterations=5, decomposer=decomposer
+    )
+    res1 = sel.run()
+    res2 = sel2.run()
+    # res2 = sel2.run()
+    res1 == res2
+    print(res1.results)
+    print(res2[0].results)
+    print(res2[1].results)
 
 def leukemia():
-    import pickle
+    pass
+    # import pickle
     # Transpose, as in file has features on rows
-    leuk: pd.DataFrame = pd.read_csv('~/nmf/data/surface_data.csv', index_col=0).astype('float64')
+    # leuk: pd.DataFrame = pd.read_csv('~/nmf/data/surface_data.csv', index_col=0).astype('float64')
     # tara.drop(columns=['description'],inplace=True)
-    select = NMFMultiSelect(ranks=(8, 8), beta_loss='kullback-leibler', iterations=10, nmf_max_iter=10000,
-                            solver='mu', methods=['mad'])
-    results = select.run(leuk)
-    with open('/home/hal/nmf/rerun_surf.res', 'wb') as f:
-        pickle.dump(results, f)
+    # select = NMFMultiSelect(ranks=(8, 8), beta_loss='kullback-leibler', iterations=10, nmf_max_iter=10000,
+                            # solver='mu', methods=['mad'])
+    # results = select.run(leuk)
+    # with open('/home/hal/nmf/rerun_surf.res', 'wb') as f:
+    #     pickle.dump(results, f)
 
 if __name__ == "__main__":
     import cProfile
-    # cProfile.run("tests()", "selection.prof")
+    prof = cProfile.Profile()
+    prof.enable()
     # tests()
     orientation_tests()
+    prof.disable()
+    prof.dump_stats("refactor.stats")
     # leukemia()

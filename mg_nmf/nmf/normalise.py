@@ -6,46 +6,48 @@ import numpy as np
 from typing import Tuple, Callable, Optional
 
 
-def map_maximum(W: pd.DataFrame, xarg: float = None) -> pd.DataFrame:
+def map_maximum(H: pd.DataFrame, xarg: float = None) -> pd.DataFrame:
     """Map W to a vector of the maximum of each column."""
-    return W.max(axis=0)
+    return H.max(axis=1)
 
 
-def map_quantile(W: pd.DataFrame, quantile: float) -> pd.DataFrame:
+def map_quantile(H: pd.DataFrame, quantile: float) -> pd.DataFrame:
     """Map W to a vector for the <quantile> quantile of each column."""
-    return W.quantile(quantile, axis=0)
+    return H.quantile(quantile, axis=1)
 
 
 def normalise(N: pd.DataFrame, W: Optional[pd.DataFrame], H: Optional[pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Given a mapping of column Wj to some value Nj, normalise WH by N. Set W or H to none to skip normalising."""
     # Make D, a diagonal matrix whose j-th diagonal entry Dj = Nj
     D: np.ndarray = np.diag(N)
-    H_norm: Optional[pd.DataFrame] = None
-    if H is not None:
-        H_norm = D.dot(H)
     W_norm: Optional[pd.DataFrame] = None
     if W is not None:
-        W_norm: pd.DataFrame = W.dot(np.linalg.inv(D))
+        W_norm = W.dot(D)
+    H_norm: Optional[pd.DataFrame] = None
+    if H is not None:
+        H_norm: pd.DataFrame = pd.DataFrame(np.linalg.inv(D).dot(H))
+        H_norm.columns = H.columns
+        H_norm.index = H.index
     return W_norm, H_norm
 
 
-def difference_filter(W_norm: pd.DataFrame, T: float = 0.5) -> pd.DataFrame:
+def difference_filter(H_norm: pd.DataFrame, T: float = 0.5) -> pd.DataFrame:
     """Filter potentially insignificant metagenes based on the difference between min/max in samples. T is proportion
     of genes to filter out. W should have normalised using one of the normalisation methods."""
-    u: pd.DataFrame = W_norm.max(axis=1) - W_norm.min(axis=1)
+    u: pd.DataFrame = H_norm.max(axis=1) - H_norm.min(axis=0)
     u_quantile = u.quantile(T)
     # Filter u to contain only those entries < u_quantile
     u = u[u > u_quantile]
-    return W_norm.loc[u.index]
+    return H_norm.loc[u.index]
 
 
-def variance_filter(W_norm: pd.DataFrame, T: float = 0.5) -> pd.DataFrame:
+def variance_filter(H_norm: pd.DataFrame, T: float = 0.5) -> pd.DataFrame:
     """Filter potentially insignificant metagenes based on the variance among samples. T is proportion to discard, from 0
     to 1. W should have been normalised using one of the normalisation methods."""
-    u: pd.DataFrame = pd.DataFrame(W_norm.var(axis=1))
+    u: pd.DataFrame = H_norm.var(axis=0).to_frame()
     u_quantile = u.quantile(T)
-    u = u[u[0] > u_quantile[0]]
-    return W_norm.loc[u.index]
+    u = u[u[0] >= u_quantile[0]]
+    return H_norm.loc[:, u.index]
 
 
 if __name__ == "__main__":

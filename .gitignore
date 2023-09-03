@@ -6,3 +6,5 @@ mg_nmf/test/data/large_enrichment
 mg_nmf/test/data/test_multires.res
 .idea/
 gs_data/
+mg_nmf/nmf/gs_data/
+*.prof

@@ -245,7 +245,8 @@ def model_to_map(h: pd.DataFrame, coords: pd.DataFrame, lat_lon: Tuple[str, str]
 
 def model_to_piemap(h: pd.DataFrame, coords: pd.DataFrame, lat_lon: Tuple[str, str],
                     latlon_margin: Tuple[float, float] = (5., 5.), pie_size: float = 350,
-                    fig_width: float = 10.0, alpha: float = 0.9, colors: Optional[List[str]] = None,
+                    fig_width: float = 10.0, alpha: float = 0.9, dpi: int = 90,
+                    colors: Optional[List[str]] = None,
                     lat_bounds: Optional[Tuple[float, float]] = None,
                     lon_bounds: Optional[Tuple[float, float]] = None) -> Tuple[plt.Figure, plt.Axes]:
     """
@@ -256,6 +257,7 @@ def model_to_piemap(h: pd.DataFrame, coords: pd.DataFrame, lat_lon: Tuple[str, s
     :param latlon_margin: Margins to add to bounds of plot, in degrees. Tuple in order latitude, longitude.
     :param pie_size: Size of pie chart.
     :param fig_width: Width of figure, in inches. Height adjusted automatically.
+    :param dpi: DPI of the figure
     :param alpha: Transparency of pie chart (0-1).
     :param colors: Colors to use for pie segements. Default to plotly colours.
     :param lat_bounds: Upper and lower bound of latitude to plot. If not provided, calculated from input data.
@@ -294,7 +296,7 @@ def model_to_piemap(h: pd.DataFrame, coords: pd.DataFrame, lat_lon: Tuple[str, s
     # Determine suitable plot height (not perfect due to variation in projections)
     height = ((urlat - lllat) / (urlon - lllon)) * fig_width
     # Create figure and axes
-    fig = plt.figure(figsize=(fig_width, height))
+    fig = plt.figure(figsize=(fig_width, height), dpi=dpi)
     ax = fig.add_axes([0, 0, 1, 1])
     # Create map
     m = Basemap(resolution='l', projection='merc', llcrnrlat=lllat, urcrnrlat=urlat, llcrnrlon=lllon,
@@ -309,7 +311,7 @@ def model_to_piemap(h: pd.DataFrame, coords: pd.DataFrame, lat_lon: Tuple[str, s
         # m converts lat/lon to coordinate values on projection
         rlat, rlon = m(vals[lon], vals[lat])
         # Convert componennt weights to ratios
-        weights = np.array([vals[x] for x in vals.index if x[0] == 'c'])
+        weights = np.array([vals[x] for x in vals.index if x in h.columns])
         ratios = weights / weights.sum()
 
         # Adapting https://www.geophysique.be/2010/11/15/matplotlib-basemap-tutorial-05-adding-some-pie-charts/
@@ -430,33 +432,33 @@ def rgb_to_string(df):
     return color_str
 
 if __name__ == '__main__':
-    # Some tests
-    rnd_data: pd.DataFrame = selection.shuffle_frame(selection.synthdata.sparse_overlap_even(
-        rank=3, noise=(0, 2), size=(100, 500), p_ubiq=0.0, m_overlap=0.0, n_overlap=0.0)
-    )
-
-    # Apply multiselect to see if we can get warnings
-    ms = selection.NMFMultiSelect(ranks=list(range(2, 6)), methods=['perm'], iterations=10,
-                                  beta_loss='kullback-leibler', solver='mu')
-    ms_res = ms.run(rnd_data)
-    multiselect_plot(ms_res)
-
-    # Apply standard NMF
-    selector = selection.NMFConsensusSelection(rnd_data, k_min=2, k_max=7, solver='mu', beta_loss='kullback-leibler',
-                                            iterations=10, nmf_max_iter=10000)
-    results: selection.NMFResults = selector.run()
-
-    print('TEST CORR')
-    cophenetic_plot(results[0])
-    model_3: selection.NMFModelSelectionResults = [x for x in results[0].results if x.k == 3][0]
-
-    print('TEST ORDER')
-    w_order: pd.DataFrame = affinity_order(model_3.w, axis = 1)
-    print(w_order)
-
-    print('TEST HMAP')
-    heatmap_plot(model_3, flip=False, axes=[0,1])
-    f = 'b'
+    # # Some tests
+    # rnd_data: pd.DataFrame = selection.shuffle_frame(selection.synthdata.sparse_overlap_even(
+    #     rank=3, noise=(0, 2), size=(100, 500), p_ubiq=0.0, m_overlap=0.0, n_overlap=0.0)
+    # )
+    #
+    # # Apply multiselect to see if we can get warnings
+    # ms = selection.NMFMultiSelect(ranks=list(range(2, 6)), methods=['perm'], iterations=10,
+    #                               beta_loss='kullback-leibler', solver='mu')
+    # ms_res = ms.run(rnd_data)
+    # multiselect_plot(ms_res)
+    #
+    # # Apply standard NMF
+    # selector = selection.NMFConsensusSelection(rnd_data, k_min=2, k_max=7, solver='mu', beta_loss='kullback-leibler',
+    #                                         iterations=10, nmf_max_iter=10000)
+    # results: selection.NMFResults = selector.run()
+    #
+    # print('TEST CORR')
+    # cophenetic_plot(results[0])
+    # model_3: selection.NMFModelSelectionResults = [x for x in results[0].results if x.k == 3][0]
+    #
+    # print('TEST ORDER')
+    # w_order: pd.DataFrame = affinity_order(model_3.w, axis = 1)
+    # print(w_order)
+    #
+    # print('TEST HMAP')
+    # heatmap_plot(model_3, flip=False, axes=[0,1])
+    # f = 'b'
     # print('TARA DATA')
     # t_data = pd.read_csv('data/last_tara_run_data.csv', index_col=0)
     # import normalise as norm
@@ -486,25 +488,25 @@ if __name__ == '__main__':
     # with open('data/last_tara_run.results', 'rb') as f:
     #     exp = pickle.load(f)
     # exp = selection.NMFResults.load_results('/home/hal/Dropbox/PHD/FunctionalAbundance/nmf/data/metatranscriptome_k6.model')
-    # exp = pd.read_csv('~/Dropbox/PHD/h_no_map.csv', index_col=0)
+    exp = pd.read_csv('~/Dropbox/PHD/h_no_map.csv', index_col=0)
     #
     # # Load station metadata for lat / lon
-    # metadata = pd.read_csv('~/Dropbox/PHD/FunctionalAbundance/nmf/data/tara/ERP001736.csv', index_col='Run')
-    # # Filter metadata to only runs in our index
-    # runs = exp.index.map(lambda x: x.split(' ')[0].strip())
-    # metadata = metadata.loc[runs][['Latitude Start', 'Longitude Start']]
+    metadata = pd.read_csv('~/Dropbox/PHD/FunctionalAbundance/nmf/data/tara/ERP001736.csv', index_col='Run')
+    # Filter metadata to only runs in our index
+    runs = exp.index.map(lambda x: x.split(' ')[0].strip())
+    metadata = metadata.loc[runs][['Latitude Start', 'Longitude Start']]
     #
     # # heatmap_plot(next(x for x in exp.results if x.k == 4), axes=[0,1], optorder_axes=(True, False))
     # # Fix index of model (remove station names)
-    # modh = exp
-    # modh.index = modh.index.map(lambda x: x.split(' ')[0].strip())
+    modh = exp
+    modh.index = modh.index.map(lambda x: x.split(' ')[0].strip())
     # #  Testing RGB model with 0 values for weight of components
     # # model_to_map(exp, metadata, lat_lon=('Latitude Start', 'Longitude Start'),
     # #              split=lambda x: 'all', scale=True)[0].show()
-    # model_to_piemap(modh, metadata, lat_lon=('Latitude Start', 'Longitude Start'), latlon_margin=(2, 9), fig_width=6,
-    #                 colors=px.colors.qualitative.Light24)
-    # plt.show()
-    # plt.close('all')
+    model_to_piemap(modh, metadata, lat_lon=('Latitude Start', 'Longitude Start'), latlon_margin=(2, 9), fig_width=6,
+                    colors=px.colors.qualitative.Light24, dpi=180)
+    plt.show()
+    plt.close('all')
     # heatmap_plot(exp, ordering='heirarchical', optorder_axes=[False, False])
     # plt.show()
     # import pickle
