@@ -70,7 +70,7 @@ def hierarchical_order(df: pd.DataFrame, axis=0, link_method='average', optlorde
         data = data.T
     return (data, opt_lorder)
 
-def heatmap_plot(result: selection.NMFModelSelectionResults, w_dot_h: bool = False, file: str = None,
+def heatmap_plot(result: selection.NMFSingleResult, w_dot_h: bool = False, file: str = None,
                  figsize: Tuple[float, float] = (12, 16), dpi: int = 90, log: bool = False, cbar: bool = False,
                  ordering: str = 'affinity', linkage_method='average', axes = [0, 1],
                  optorder_axes: Tuple[bool, bool] = (True, True), return_fig: bool = False, flip = False):

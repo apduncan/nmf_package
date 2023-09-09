@@ -35,14 +35,14 @@ class NMFGeneSetEnrichment:
     """
 
 
-    def __init__(self, model: selection.NMFModelSelectionResults, data: pd.DataFrame, gene_sets: Dict[str, Set[str]],
+    def __init__(self, model: selection.NMFSingleResult, data: pd.DataFrame, gene_sets: Dict[str, Set[str]],
                  gene_set_metadata: Dict[str, Dict[str, Any]] = None, gene_names: Dict[str, str] = None,
                  label: str = 'analysis', permutation_num: int = 100, outdir: str = None, processes: int = 1,
                  max_size: Optional[int] = 500, min_size: Optional[int] = 15) -> None:
         """ Initialise Gene Set Enrichment object.
 
         :param model: Results of a model selection process to look for term enrichment in
-        :type model: NMFModelSelectionResults
+        :type model: NMFSingleResult
         :param data: Training data the model was built from
         :type data: DataFrame
         :param gene_sets: Set of genes to test for enrichment. Provide as dictionary where key is name of gene set,
@@ -84,14 +84,14 @@ class NMFGeneSetEnrichment:
         self.__index_col: Optional[str] = None
 
     @property
-    def model(self) -> selection.NMFModelSelectionResults:
+    def model(self) -> selection.NMFSingleResult:
         """Model to analyse."""
         return self.__model
 
     @model.setter
-    def model(self, model: selection.NMFModelSelectionResults) -> None:
+    def model(self, model: selection.NMFSingleResult) -> None:
         """Model to analyse."""
-        self.__model: selection.NMFModelSelectionResults = model
+        self.__model: selection.NMFSingleResult = model
 
     @property
     def data(self) -> pd.DataFrame:
@@ -913,7 +913,7 @@ class GeneSets(object):
 
 if __name__ == '__main__':
     from pickle import dump, load
-    from mg_nmf.nmf.selection import NMFResults, NMFModelSelectionResults
+    from mg_nmf.nmf.selection import NMFResults, NMFSingleResult
 
     # # Load some premade model results
     # MODEL_RES = '/home/hal/nmf/rerun_surf.res'

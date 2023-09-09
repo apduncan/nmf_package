@@ -270,7 +270,7 @@ class TestNMFResults(unittest.TestCase):
         self.assertEqual(len(self.res.results), self.K_TO - self.K_FROM + 1)
         # Check that the selected result does actually have optimal value for selection criteria
         top_metric: float = -np.inf
-        top_res: selection.NMFModelSelectionResults
+        top_res: selection.NMFSingleResult
         for res in self.res.results:
             if res.metric >= top_metric:
                 top_metric = res.metric

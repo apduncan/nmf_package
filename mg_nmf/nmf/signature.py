@@ -6,14 +6,22 @@ Non-Negative Matrix Factorization decomposition.
 
 from __future__ import annotations
 from tkinter import W
-from typing import List, Tuple
+from typing import List, Tuple, NamedTuple, Optional
 import pandas as pd, math
 import numpy as np
+import scipy.stats as stats
 from scipy.signal import argrelextrema
 from scipy.stats import gaussian_kde, pearsonr
 
-from mg_nmf.nmf.selection import NMFModelSelectionResults, NMFResults, NMFModelSelection
-import scipy.stats as stats
+# from mg_nmf.nmf.selection import NMFModelSelectionResults, NMFModelSelection, NMFModel, NMFOptions, \
+#     NMFDecomposer
+from mg_nmf.nmf import selection as sel
+
+
+class SelectionResults(NamedTuple):
+    """Feature selection returns some measure of importance, and in some cases an associated p-value."""
+    measure: pd.DataFrame
+    p: Optional[pd.DataFrame]
 
 
 class FeatureSelection():
@@ -28,7 +36,7 @@ class FeatureSelection():
     feature_name: str                   -- the name of the feature in the input data
     """
 
-    def __init__(self, model: NMFModelSelectionResults, data: pd.DataFrame) -> None:
+    def __init__(self, model: sel.NMFModel, data: pd.DataFrame) -> None:
         """Intialise feature importance method.
 
         :param model: Model to evaluate
@@ -36,12 +44,12 @@ class FeatureSelection():
         :param data: Input data model was learnt from
         :type data: DataFrame
         """
-        self.__model: NMFModelSelectionResults = model
+        self.__model: sel.NMFModel = model
         self.__data: pd.DataFrame = data
         self.__feature_name = data.index.name
 
     @property
-    def model(self) -> NMFModelSelectionResults:
+    def model(self) -> sel.NMFModel:
         """Return model."""
         return self.__model
 
@@ -55,7 +63,7 @@ class FeatureSelection():
         """Return feature name."""
         return self.__feature_name
 
-    def select(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def select(self) -> SelectionResults:
         """Perform feature selection, returns results as data frames. First is the measure, second is p-value if
         possible.
 
@@ -77,11 +85,11 @@ class Specificity(FeatureSelection):
     https://doi.org/10.1007/s00285-011-0428-2.
     """
 
-    def __init__(self, model: NMFModelSelectionResults, data: pd.DataFrame) -> None:
+    def __init__(self, model: sel.NMFModel, data: pd.DataFrame) -> None:
         """Initialise this object."""
         super().__init__(model, data)
 
-    def select(self) -> pd.DataFrame:
+    def select(self) -> SelectionResults:
         """Generate specifity measure.
 
         :return: Returns the specificty of features for each module, p-values not available.
@@ -89,14 +97,14 @@ class Specificity(FeatureSelection):
         """
         rs: List[Tuple[str, float]] = []
         for index, row in self.model.h.T.iterrows():
-            sqrt_k = math.sqrt(self.model.k)
+            sqrt_k = math.sqrt(self.model.model.n_components)
             sum_wij = sum([abs(x) for x in row])
             sum_wij_sq = sum(math.pow(x, 2) for x in row)
             specificity = (sqrt_k - (sum_wij / math.sqrt(sum_wij_sq))) / (sqrt_k - 1)
-            rs.append((index, specificity))
+            rs.append((str(index), specificity))
         rs_frame: pd.DataFrame = pd.DataFrame(rs, columns=[self.feature_name, 'specificity'])
         rs_frame.set_index(self.feature_name, inplace=True)
-        return (rs_frame, None)
+        return SelectionResults(rs_frame, None)
 
 
 class Correlation(FeatureSelection):
@@ -114,7 +122,7 @@ class Correlation(FeatureSelection):
 
     """
 
-    def __init__(self, model: NMFModelSelectionResults, data: pd.DataFrame) -> None:
+    def __init__(self, model: sel.NMFModel, data: pd.DataFrame) -> None:
         """Initialise for correlation signature generation."""
         super().__init__(model, data)
 
@@ -126,8 +134,8 @@ class Correlation(FeatureSelection):
         """
         # Handle one component at a time
         component: str = ''
-        r_frame: pd.DataFrame = None
-        p_frame: pd.DataFrame = None
+        r_frame: Optional[pd.DataFrame] = None
+        p_frame: Optional[pd.DataFrame] = None
         for component in list(self.model.h.index):
             r, p = self._correlate_one(component)
             if r_frame is None:
@@ -135,14 +143,14 @@ class Correlation(FeatureSelection):
             else:
                 r_frame[component] = r[component]
                 p_frame[component] = p[component]
-        return (r_frame, p_frame)
+        return SelectionResults(r_frame, p_frame)
 
     def _correlate_one(self, component: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Correlate component with given index to each gene in data."""
         # Get component values by slicing model results
-        comp: pd.DataFrame = self.model.w.loc[:, component]
+        comp: pd.DataFrame = self.model.w(self.data).loc[:, component]
         # Loop over each gene in source data and correlate
-        res: List[Tuple[str, float]] = []
+        res: List[Tuple[str, float, float]] = []
         for index, row in self.data.T.iterrows():
             r, p = stats.pearsonr(row, comp)
             res.append((index, r, p))
@@ -150,19 +158,19 @@ class Correlation(FeatureSelection):
                                              columns=[self.feature_name, component]).set_index(self.feature_name)
         p_frame: pd.DataFrame = pd.DataFrame([(x[0], x[2]) for x in res],
                                              columns=[self.feature_name, component]).set_index(self.feature_name)
-        return (r_frame, p_frame)
+        return SelectionResults(r_frame, p_frame)
 
 
 class LeaveOneOut(FeatureSelection):
     """Use the decrease in correlation between source data and WH with one component left out to assess which
     features are significant to which component."""
 
-    def __init__(self, model: NMFModelSelectionResults, data: pd.DataFrame, 
+    def __init__(self, model: sel.NMFModel, data: pd.DataFrame,
                  fillna: float = 0) -> None:
         """
         :param fillna: Where Pearson correlation is undefined, replace with this value. Set to None to leave undefined.
                        This will mean where a feature only has weight in one component, the LOO change in correlation 
-                       will appear as NaN. Such feature will not be assigned using ThresholdAssignment. Defaut fills 
+                       will appear as NaN. Such features will not be assigned using ThresholdAssignment. Default fills
                        with 0.
         :type fillna: float
         """
@@ -177,29 +185,30 @@ class LeaveOneOut(FeatureSelection):
     def fillna(self, fillna: float) -> None:
         self.__fillna: float = fillna
 
-    def select(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def select(self) -> SelectionResults:
         """Compute correlations between X and WH with one component at a time left out of WH. A decrease in correlation
         compared to full WH indicates that the gene is significant to that component.
 
         :return: Return the LOOCD of each feature and module, p-value not available
         :rtype: Tuple[DataFrame, None]
         """
-        wh: pd.DataFrame = self.model.w.dot(self.model.h)
-        corr_complete: pd.Series = wh.corrwith(self.model.data, axis=0)
+        w: pd.DataFrame = self.model.w(self.data)
+        wh: pd.DataFrame = w.dot(self.model.h)
+        corr_complete: pd.Series = wh.corrwith(self.data, axis=0)
         delta_corr: List[pd.series] = []
-        for c_lo in self.model.w.columns:
+        for c_lo in w.columns:
             # c_lo is the component we're interested in and will leave out
-            c_include: List[str] = list(filter(lambda x: x != c_lo, self.model.w.columns))
+            c_include: List[str] = list(filter(lambda x: x != c_lo, w.columns))
             # Make WH with c_lo removed
             rh: pd.DataFrame = self.model.h.loc[c_include]
-            rw: pd.DataFrame = self.model.w[c_include]
+            rw: pd.DataFrame = w[c_include]
             rcorr: pd.DataFrame = rw.dot(rh).corrwith(self.data, axis=0)
             if self.fillna is not None:
                 rcorr = rcorr.fillna(self.fillna)
             r_diff: pd.Series = rcorr - corr_complete
             r_diff.name = c_lo
             delta_corr.append(r_diff)
-        return pd.DataFrame(delta_corr).T, None
+        return SelectionResults(pd.DataFrame(delta_corr).T, None)
 
 
 class Permutation(FeatureSelection):
@@ -211,28 +220,26 @@ class Permutation(FeatureSelection):
     permutations: int                       -- Number of times to perform permuted learning
     """
 
-    def __init__(self, model: NMFModelSelectionResults, data: pd.DataFrame, permute_learner: NMFModelSelection,
+    def __init__(self, model: sel.NMFModel, data: pd.DataFrame, permute_options: sel.NMFOptions,
                  permutations: int = 50) -> None:
         """Must provide a model section method with the parameters for training on the permuted data set.
 
-        :param permute_learner: NMFModelSelection object to perform the permuted learning
-        :type permute_learner: NMFModelSelection
+        :param permute_options: Settings to use when decomposing permuted data
+        :type permute_learner: NMFOptions
         :param permutations: Number of times to perform permuted learning
         :type permutations: int
         """
         super().__init__(model, data)
-        self.permute_learner = permute_learner
+        self.permute_options = permute_options
         self.permutations = permutations
 
     @property
-    def permute_learner(self) -> NMFModelSelection:
-        return self.__permute_learner
+    def permute_options(self) -> sel.NMFOptions:
+        return self.__permute_options
 
-    @permute_learner.setter
-    def permute_learner(self, permute_learner: NMFModelSelection) -> None:
-        self.__permute_learner: NMFModelSelection = permute_learner
-        self.permute_learner.k_values = [self.model.k]
-        self.permute_learner.iterations = 1
+    @permute_options.setter
+    def permute_options(self, permute_options: sel.NMFModelSelection) -> None:
+        self.__permute_options: sel.NMFModelSelection = permute_options
 
     @property
     def permutations(self) -> int:
@@ -244,13 +251,16 @@ class Permutation(FeatureSelection):
 
     def __run_permutation(self) -> pd.DataFrame:
         """Permute data and run training once."""
-        permuted = self.data.copy()
+        permuted: pd.DataFrame = self.data.copy()
         for col in permuted.columns:
             permuted[col] = permuted[col].sample(frac=1).values
-        self.permute_learner.data = permuted
-        res = self.permute_learner.run()
+        res: sel.NMFModel = sel.NMFDecomposer(permuted, self.permute_options, cache=False).decompose(
+            rank=self.model.model.n_components,
+            n=1,
+            cached=False
+        )[0]
         # Only need the weights of features in components
-        return res[0].selected.h.T
+        return res.h
 
     def __gene_probability(self, row: pd.Series) -> pd.Series:
         """Compute probabilities for one feature"""
@@ -268,10 +278,10 @@ class Permutation(FeatureSelection):
         :rtype: Tuple[DataFrame, None]
         """
         # Run permuted learning
-        perm_tbl = pd.concat([self.__run_permutation() for i in range(self.permutations)], axis=1)
+        perm_tbl: pd.DataFrame = pd.concat([self.__run_permutation() for i in range(self.permutations)], axis=1)
         # Find probabilities that a given weight would be drawn from distribution of permuted weights
-        p = perm_tbl.apply(self.__gene_probability, axis=1)
-        return p, None
+        p: pd.DataFrame = perm_tbl.apply(self.__gene_probability, axis=1)
+        return SelectionResults(p, None)
 
 
 class FeatureAssignment:
@@ -395,18 +405,18 @@ class ThresholdAssignment(FeatureAssignment):
 class GreedyCorrelationAssignment(FeatureAssignment):
     """Assign genes to components by adding to the set of components each gene represents, until the correlation
     between the model with those components and the source data inreases less than the delta threshold amount."""
-    def __init__(self, correlation: pd.DataFrame, model: NMFModelSelectionResults, delta: float) -> None:
+    def __init__(self, correlation: pd.DataFrame, model: sel.NMFSingleResult, delta: float) -> None:
         super().__init__(correlation)
         self.model = model
         self.delta = delta
 
     @property
-    def model(self) -> NMFModelSelectionResults:
+    def model(self) -> sel.NMFSingleResult:
         return self.__model
 
     @model.setter
-    def model(self, model: NMFModelSelectionResults) -> None:
-        self.__model: NMFModelSelectionResults = model
+    def model(self, model: sel.NMFSingleResult) -> None:
+        self.__model: sel.NMFSingleResult = model
 
     @property
     def delta(self) -> float:

@@ -5,6 +5,9 @@ Initially designed for use on """
 from __future__ import annotations
 
 import itertools
+import os.path
+import pickle
+from itertools import combinations, starmap
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -12,7 +15,8 @@ from functools import reduce
 import multiprocessing
 import random
 import time
-from typing import List, Tuple, Dict, Callable, Union, Optional, Iterable, NamedTuple
+from statistics import mean, median
+from typing import List, Tuple, Dict, Callable, Union, Optional, Iterable, NamedTuple, Set, Type
 import warnings
 
 # Dependency imports
@@ -20,19 +24,21 @@ from joblib import dump, load
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from plotly import graph_objs as go, colors as colors
 import seaborn as sns
 import scipy.cluster.hierarchy as hierarchy
 import scipy.spatial.distance as distance
 import scipy.optimize as optimize
 from scipy import stats
+from scipy.optimize import linear_sum_assignment
 from sklearn.decomposition import NMF
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import pairwise_distances, adjusted_rand_score
+from sklearn.metrics import pairwise_distances, adjusted_rand_score, jaccard_score
 from wNMF import wNMF
 
-import normalise
 # Local imports
-from mg_nmf.nmf import normalise as norm, synthdata as synthdata
+from mg_nmf.nmf import normalise as norm, synthdata as synthdata, signature as sig
+# from mg_nmf.nmf.signature import LeaveOneOut, SelectionResults, ThresholdAssignment
 
 
 class BetaLoss(Enum):
@@ -51,9 +57,21 @@ class Initialization(Enum):
 
 
 class Solver(Enum):
+    """Types of solver available in NMF."""
     MULTIPLICATIVE_UPDATE: str = "mu"
     COORDINATE_DESCENT: str = "cd"
 
+
+class SummariseMethod(NamedTuple):
+    """Method which can summarise when there are multiple values for each rank."""
+    name: str
+    function: Callable[[List[float]], float]
+    plot_color: str
+
+class MetricSummarise(Enum):
+    """Convenience function to provide methods to summarise multiple metrics."""
+    MEAN: SummariseMethod = SummariseMethod("mean", mean, "black")
+    MEDIAN: SummariseMethod = SummariseMethod("median", median, "grey")
 
 class NMFModel(NamedTuple):
     """Filtering can lead to a model being fit on a subset of features. This class stores both the model, and
@@ -366,10 +384,10 @@ class NMFDecomposer:
             return from_cache
 
         # Construct a list of arguments for the call to _run_for_k
-        random_state: random.Random = (self.__decompositions[rank].seed_generator if not cached or not self.__cache
+        random_state: random.Random = (self.__decompositions[rank].seed_generator if not cached and not self.__cache
                                        else random)
         args: Iterable[Tuple[int, int]] = (
-            (rank, self.__decompositions[rank].seed_generator.randint(0, self.MAX_RAND_INT)) for _ in range(needed)
+            (rank, random_state.randint(0, self.MAX_RAND_INT)) for _ in range(needed)
         )
 
         # Run the required number of times
@@ -669,16 +687,16 @@ class NMFConsensusSelection(NMFModelSelection):
         :return: results of tuples of model selection metrics, first is cophenetic correlation, second dispersion
         :rtype: (NMFResults, NMFResults), or NMFResults
         """
-        results: List[Tuple[NMFModelSelectionResults, NMFModelSelectionResults]] = list()
+        results: List[Tuple[NMFSingleResult, NMFSingleResult]] = list()
         for i in self.k_values:
             print(f'[{time.strftime("%X")}] AGGREGATE {i}')
             kmodels: List[NMFModel] = self.decomposer.decompose(i, self.iterations)
-            kresults: Tuple[NMFModelSelectionResults, NMFModelSelectionResults] = self._results_for_k(i, kmodels)
+            kresults: Tuple[NMFSingleResult, NMFSingleResult] = self._results_for_k(i, kmodels)
             results.append(kresults)
         print(f'[{time.strftime("%X")}] AGGREGATION COMPLETE')
         # Process all the different runs for a value of k
-        coph_res: List[NMFModelSelectionResults] = [x[0] for x in results]
-        disp_res: List[NMFModelSelectionResults] = [x[1] for x in results]
+        coph_res: List[NMFSingleResult] = [x[0] for x in results]
+        disp_res: List[NMFSingleResult] = [x[1] for x in results]
         if self.metric == 'cophenetic':
             return NMFResults(coph_res, self.decomposer.data)
         if self.metric == 'dispersion':
@@ -705,7 +723,7 @@ class NMFConsensusSelection(NMFModelSelection):
     def _results_for_k(self,
                        k: int,
                        models: List[NMFModel]
-                       ) -> Tuple[NMFModelSelectionResults, NMFModelSelectionResults]:
+                       ) -> Tuple[NMFSingleResult, NMFSingleResult]:
         """Create models and assess cophenetic correlation and dispersion for k components.
 
         :param k: number of components in the learnt models
@@ -732,13 +750,14 @@ class NMFConsensusSelection(NMFModelSelection):
         w: pd.DataFrame = best_model.w(self.decomposer.data)
         w, h = self.decomposer.normalise(best_model, w)
         return (
-            NMFModelSelectionResults(k, c, c_bar, w, h, best_model, self.decomposer.data),
-            NMFModelSelectionResults(k, dispersion, c_bar, w, h, best_model, self.decomposer.data)
+            NMFSingleResult(k, c, c_bar, w, h, best_model, self.decomposer.data),
+            NMFSingleResult(k, dispersion, c_bar, w, h, best_model, self.decomposer.data)
         )
 
     def __repr__(self):
         return (f'NMFConsensusSelection(k_values={self.k_values}, iterations={self.iterations}, metric={self.metric}, '
                 f'decomposer={id(self.decomposer)})')
+
 
 # noinspection SpellCheckingInspection
 class NMFConcordanceSelection(NMFModelSelection):
@@ -760,11 +779,11 @@ class NMFConcordanceSelection(NMFModelSelection):
         :return: model selection results
         :rtype: NMFResults
         """
-        results: List[NMFModelSelectionResults] = list()
+        results: List[NMFSingleResult] = list()
         for i in self.k_values:
             print(f'[{time.strftime("%X")}] AGGREGATE {i}')
             kmodels: List[NMFModel] = self.decomposer.decompose(rank=i, n=self.iterations)
-            kresults: NMFModelSelectionResults = self._results_for_k(i, kmodels)
+            kresults: NMFSingleResult = self._results_for_k(i, kmodels)
             results.append(kresults)
         print(f'[{time.strftime("%X")}] AGGREGATION COMPLETE')
         # Process all the different runs for a value of k
@@ -780,7 +799,7 @@ class NMFConcordanceSelection(NMFModelSelection):
             extract += a_list[i][:i]
         return extract
 
-    def _results_for_k(self, k: int, models: List[NMFModel]) -> NMFModelSelectionResults:
+    def _results_for_k(self, k: int, models: List[NMFModel]) -> NMFSingleResult:
         """Create models and assess stability for k components.
 
         :param k: number of components in models
@@ -788,7 +807,7 @@ class NMFConcordanceSelection(NMFModelSelection):
         :param models: list of models learnt
         :type models: [NMF]
         :return: model selection results for this value of k
-        :rtype: NMFModelSelectionResults
+        :rtype: NMFSingleResult
         """
 
         # The paper states that similarity matrix S is calculates from 'sample projection' matrix H
@@ -827,7 +846,7 @@ class NMFConcordanceSelection(NMFModelSelection):
         # Find mean of squared difference between best_S and S_j
         # ci = 1 - np.median(diffs)
         ci = 1 - np.mean(diffs)
-        return NMFModelSelectionResults(k, ci, None, best_W, best_H, best_model, self.decomposer.data)
+        return NMFSingleResult(k, ci, None, best_W, best_H, best_model, self.decomposer.data)
 
 
 # noinspection SpellCheckingInspection
@@ -853,38 +872,41 @@ class NMFSplitHalfSelection(NMFModelSelection):
         """
 
         i: int
-        multiproc_args: List[int] = []
+        args: List[int] = []
+        models: List[Tuple[Tuple[NMFModel, Optional[pd.DataFrame]], Tuple[NMFModel, Optional[pd.DataFrame]]]]
         for i in self.k_values:
-            multiproc_args += [i] * self.iterations
-        with multiprocessing.Pool(processes) as pool:
-            models: List[Tuple[Tuple[NMF, pd.DataFrame], Tuple[NMF, pd.DataFrame]]] = \
-                pool.map(self._run_split_for_k_single, multiproc_args)
-            pool.close()
-        results: List[NMFModelSelectionResults] = []
+            args += [i] * self.iterations
+            models = [self._run_split_for_k_single(x) for x in args]
+        results: List[NMFSingleResult] = []
         print(f'[{time.strftime("%X")}] ITERATIONS COMPLETE, AGGREGATING RESULTS')
         for i in self.k_values:
             print(f'[{time.strftime("%X")}] AGGREGATE {i}')
-            kmodels: List[Tuple[Tuple[NMF, pd.DataFrame], Tuple[NMF, pd.DataFrame]]] \
-                = [x for x in models if x[0][0].n_components == i]
-            kresults: NMFModelSelectionResults = self._results_for_k(i, kmodels)
+            kmodels: List[Tuple[Tuple[NMFModel, pd.DataFrame], Tuple[NMFModel, pd.DataFrame]]] \
+                = [x for x in models if x[0][0].model.n_components == i]
+            kresults: NMFSingleResult = self._results_for_k(i, kmodels)
             results.append(kresults)
         print(f'[{time.strftime("%X")}] AGGREGATION COMPLETE')
         # Process all the different runs for a value of k
-        return NMFResults(results, self.data)
+        return NMFResults(results, self.decomposer.data)
 
     def _run_split_for_k_single(self, k: int) \
-            -> Tuple[Tuple[NMF, Optional[pd.DataFrame]], Tuple[NMF, Optional[pd.DataFrame]]]:
+            -> Tuple[Tuple[NMFModel, Optional[pd.DataFrame]], Tuple[NMFModel, Optional[pd.DataFrame]]]:
         """Perform a single run of the selection method."""
 
         # First step is to randomly split the data in half
-        pair: Tuple[pd.DataFrame, pd.DataFrame] = train_test_split(self.data, train_size=0.5, test_size=0.5)
+        pair: Tuple[pd.DataFrame, pd.DataFrame] = train_test_split(
+            self.decomposer.data, train_size=0.5, test_size=0.5)
         # Run NMF training as normal on both halves
-        pair_models = tuple(self._run_for_k_single(k, x) for x in pair)
+        pair_models: Tuple[NMFModel] = tuple(
+            self.decomposer.for_data(x).decompose(rank=k, n=1, cached=False)[0] for x in pair)
         del pair
         return (pair_models[0], None), (pair_models[1], None)
 
-    def _results_for_k(self, k: int, dm_pairs: List[Tuple[Tuple[NMF, pd.DataFrame], Tuple[NMF, pd.DataFrame]]]) \
-            -> NMFModelSelectionResults:
+    def _results_for_k(
+            self,
+            k: int,
+            dm_pairs: List[Tuple[Tuple[NMFModel, pd.DataFrame], Tuple[NMFModel, pd.DataFrame]]]
+    ) -> NMFSingleResult:
         """Generate aRI for data which has been split and models fitted for both halves."""
         aris: List[float] = []
         for dm_pair in dm_pairs:
@@ -893,21 +915,22 @@ class NMFSplitHalfSelection(NMFModelSelection):
             # Need a measure of the cost of 'assigning'/matching H_1_f1 to H_2_f1. Not clear from descriptions how
             # other papers have done this, using Euclidean distance between observations here
             M_1, M_2 = dm_pair[0][0], dm_pair[1][0]
-            H_1, H_2 = M_1.components_, M_2.components_
+            H_1, H_2 = M_1.h, M_2.h
             costs: np.ndarray = pairwise_distances(H_1, H_2)
             row_ind, col_ind = optimize.linear_sum_assignment(costs)
             # Reorder H_2
-            H_2 = H_2[col_ind]
+            H_2 = H_2.iloc[col_ind]
             # To determine aRI index, need to assign each feature to a component
-            H_1_class: np.ndarray = np.argmax(H_1, axis=0)
-            H_2_class: np.ndarray = np.argmax(H_2, axis=0)
+            H_1_class: np.ndarray = np.argmax(H_1.values, axis=0)
+            H_2_class: np.ndarray = np.argmax(H_2.values, axis=0)
             ari: float = adjusted_rand_score(H_1_class, H_2_class)
             aris.append(ari)
         ari_median: float = np.median(aris)
         ari_mean: float = np.mean(aris)
 
         # Can't return a model, as not trained on full data. Return all other parts of results.
-        return NMFModelSelectionResults(k, ari_median, None, None, None, None, self.data)
+        return NMFSingleResult(k, ari_median, None, None, None, None,
+                               self.decomposer.data)
 
 
 # noinspection SpellCheckingInspection
@@ -931,36 +954,42 @@ class NMFPermutationSelection(NMFModelSelection):
         :rtype: NMFResults
         """
         i: int
-        with multiprocessing.Pool(processes) as pool:
-            results: List[Tuple[NMF, int]] = pool.map(self._run_once, range(self.iterations))
-            pool.close()
-        resultobjs: List[NMFModelSelectionResults] = []
+        results: List[Tuple[Optional[NMFModel], Optional[int]]] = list(map(self._run_once, range(self.iterations)))
+        resultobjs: List[NMFSingleResult] = []
         print(f'[{time.strftime("%X")}] ITERATIONS COMPLETE, AGGREGATING RESULTS')
-        nonnull_results: List[Tuple[NMF, int]] = [x for x in results if x[0] is not None]
+        nonnull_results: List[Tuple[NMFModel, int]] = [x for x in results if x[0] is not None]
         for i in self.k_values:
             print(f'[{time.strftime("%X")}] AGGREGATE {i}')
             # Select the models for which i was selected as optimal k
-            kmodels: List[Tuple[NMF, int]] = [x for x in nonnull_results if x[0].n_components == i]
+            kmodels: List[Tuple[NMFModel, int]] = [x for x in nonnull_results if x[0].model.n_components == i]
             # Make this into an NMF model selection results  object
             proportion: float = len(kmodels) / len(results) if len(results) > 0 else 0
             # Select the model with best reconstruction error
-            best_model: NMF = min(kmodels, key=lambda x: x[0].reconstruction_err_)[0] if len(kmodels) > 0 else None
-            resobj: NMFModelSelectionResults = (
-                NMFModelSelectionResults(i, proportion, None, None, None, best_model, self.data)
+            best_model: NMFModel = min(
+                kmodels, key=lambda x: x[0].model.reconstruction_err_
+            )[0] if len(kmodels) > 0 else None
+            resobj: NMFSingleResult = (
+                NMFSingleResult(k=i,
+                                metric=proportion,
+                                connectivity=None,
+                                w=best_model.w(self.decomposer.data),
+                                h=best_model.h,
+                                model=best_model,
+                                data=self.decomposer.data)
             )
             resultobjs.append(resobj)
         print(f'[{time.strftime("%X")}] AGGREGATION COMPLETE')
         # Output proportion of runs where no stopping criteria was met
-        null_models: List[Tuple[NMF, int]] = [x for x in results if x[0] is None]
+        null_models: List[Tuple[NMFModel, int]] = [x for x in results if x[0] is None]
         null_prop: float = len(null_models) / len(results) if len(results) > 0 else 0
         print(f'[{time.strftime("%X")}] PERMUTATION STOPPING REPORT')
         print(f'[{time.strftime("%X")}] Condition not met: {null_prop:.2%}')
         print(f'[{time.strftime("%X")}] If stopping condition not met in high proportion of runs, ' +
               f'consider raising value of k search')
         # Process all the different runs for a value of k
-        return NMFResults(resultobjs, self.data)
+        return NMFResults(resultobjs, self.decomposer.data)
 
-    def _run_once(self, i: int) -> Tuple[NMF, int]:
+    def _run_once(self, i: int) -> Tuple[Optional[NMFModel], Optional[int]]:
         """Run permutation once. Of n runs, this is the i-th. Not used, but parameter included as pool map method
         passes a parameter
 
@@ -970,22 +999,22 @@ class NMFPermutationSelection(NMFModelSelection):
         :rtype: (NMF, int)
         """
         # First step is to permute each row of the data
-        shuffled: pd.DataFrame = self.data.copy().T
+        shuffled: pd.DataFrame = self.decomposer.data.copy().T
         for col in shuffled.columns:
             shuffled[col] = np.random.permutation(shuffled[col])
         shuffled = shuffled.T
         recon_errs: List[Tuple[float, float]] = []
         for k in self.k_values:
-            # Run NMF as usual on both shuffled and permuted data
-            reg_model: NMF = self._run_for_k_single(k, self.data)
-            shuf_model: NMF = self._run_for_k_single(k, shuffled)
+            # Fetch i-th decomposition on regular data, and run on shuffled data
+            reg_model: NMFModel = self.decomposer.decompose(rank=k, n=i+1)[-1]
+            shuf_model: NMFModel = self.decomposer.for_data(shuffled).decompose(rank=k, n=1, cached=False)[0]
             # Calculate slope from k-1 to k for each
             # Below is code to manually calculate euclidean norm, no longer using, taking whatever distance specified
             # curr_r: float = np.linalg.norm(self.data -
             # reg_model.transform(self.data).dot(reg_model.components_),  ord='fro')
             # curr_s : float = np.linalg.norm(shuffled -
             # shuf_model.transform(shuffled).dot(shuf_model.components_),  ord='fro')
-            curr_r, curr_s = reg_model.reconstruction_err_, shuf_model.reconstruction_err_
+            curr_r, curr_s = reg_model.model.reconstruction_err_, shuf_model.model.reconstruction_err_
             recon_errs.append((curr_r, curr_s))
             if len(recon_errs) > 1:
                 prev_r, prev_s = recon_errs[-2]
@@ -999,7 +1028,7 @@ class NMFPermutationSelection(NMFModelSelection):
                     # null result
                     return None, None
             # Save the current model - will want to return them if next k shows levelling of slope
-            prev_rmodel: NMF = reg_model
+            prev_rmodel: NMFModel = reg_model
 
 
 class NMFImputationSelection(NMFModelSelection):
@@ -1072,17 +1101,17 @@ class NMFImputationSelection(NMFModelSelection):
         with multiprocessing.Pool(processes) as pool:
             models: List[Tuple[wNMF, float]] = pool.map(self._run_for_k_single, multiproc_args)
             pool.close()
-        results: List[Tuple[NMFModelSelectionResults, NMFModelSelectionResults]] = []
+        results: List[Tuple[NMFSingleResult, NMFSingleResult]] = []
         print(f'[{time.strftime("%X")}] ITERATIONS COMPLETE, AGGREGATING RESULTS')
         for i in self.k_values:
             print(f'[{time.strftime("%X")}] AGGREGATE {i}')
             k_models: List[Tuple[wNMF, float]] = [x for x in models if x[0].n_components == i]
-            k_results: Tuple[NMFModelSelectionResults, NMFModelSelectionResults] = self._results_for_k(i, k_models)
+            k_results: Tuple[NMFSingleResult, NMFSingleResult] = self._results_for_k(i, k_models)
             results.append(k_results)
         print(f'[{time.strftime("%X")}] AGGREGATION COMPLETE')
         # Process all the different runs for a value of k
-        mse_results: List[NMFModelSelectionResults] = [x[0] for x in results]
-        mad_results: List[NMFModelSelectionResults] = [x[1] for x in results]
+        mse_results: List[NMFSingleResult] = [x[0] for x in results]
+        mad_results: List[NMFSingleResult] = [x[1] for x in results]
         if self.metric == 'mse':
             return NMFResults(mse_results, self.data, lambda x, y: x if x.metric < y.metric else y)
         if self.metric == 'mad':
@@ -1123,7 +1152,7 @@ class NMFImputationSelection(NMFModelSelection):
         return model, mse
 
     def _results_for_k(self, k: int, results: List[Tuple[wNMF, float]]) \
-            -> Tuple[NMFModelSelectionResults, NMFModelSelectionResults]:
+            -> Tuple[NMFSingleResult, NMFSingleResult]:
         models: List[wNMF] = [x[0] for x in results]
         metrics: List[float] = [x[1] for x in results]
         best_model: wNMF = min(models, key=lambda p: p.reconstruction_err_)
@@ -1139,10 +1168,126 @@ class NMFImputationSelection(NMFModelSelection):
         else:
             mad: float = stats.median_absolute_deviation(metrics)
         mse_result, mad_result = (
-            NMFModelSelectionResults(k, median_mse, None, W, H, best_model, self.data),
-            NMFModelSelectionResults(k, mad, None, W, H, best_model, self.data)
+            NMFSingleResult(k, median_mse, None, W, H, best_model, self.data),
+            NMFSingleResult(k, mad, None, W, H, best_model, self.data)
         )
         return mse_result, mad_result
+
+
+class NMFLOOCDSelection(NMFModelSelection):
+    """Estimate rank by evaluating the similarity of overlapping modules recovered across decompositions with random
+    initialisations. Correspondence between modules assessed using relevance (maximum Jaccard similarity with all
+    other modules, averaged across modules)."""
+
+    # TODO(apduncan): Allow specification of LOOCD threshold value
+    METRICS: List[str] = ['relevance']
+
+    def __init__(self,
+                 decomposer: NMFDecomposer,
+                 k_min: Optional[int] = None,
+                 k_max: Optional[int] = None,
+                 k_interval: Optional[int] = None,
+                 k_values: Optional[List[int]] = None,
+                 iterations: Optional[int] = None,
+                 metric: str = None,
+                 jaccard_method: str = "weighted",
+                 relevance_type: str = "paired",
+                 best_model: bool = True
+    ) -> None:
+        """Use stability of LOOCD modules across multiple random initialisations to select rank. Stability measured
+        using Jaccard similarity. The two relevance types are "relevance", which takes highest score for each module
+        in a pairwse comparison, and "paired" which matches modules using the Hungarian algorithm.
+
+        :param jaccard_method: "binary" for regular Jaccard, "weighted" to account for size of set
+        :type jaccard_method: str
+        :param relevance_type: "paired" or "relevance"
+        :type relevance_type: str
+        """
+        super().__init__(
+            decomposer=decomposer,
+            k_min=k_min,
+            k_max=k_max,
+            k_interval=k_interval,
+            k_values=k_values,
+            iterations=iterations,
+            metric=metric
+        )
+        self.jaccard_method = jaccard_method
+        self.relevance_type = relevance_type
+        self.__best_model = best_model
+
+    @property
+    def metrics(self) -> List[str]:
+        return self.METRICS
+
+    @property
+    def relevance_type(self) -> str:
+        """Return relevance type used"""
+        return self.__relevance_type
+
+    @relevance_type.setter
+    def relevance_type(self, relevance_type: str) -> None:
+        self.__relevance_type: str = relevance_type
+
+    @property
+    def jaccard_method(self) -> str:
+        """Return jaccard method."""
+        return self.__jaccard_method
+
+    @jaccard_method.setter
+    def jaccard_method(self, jaccard_method: str) -> None:
+        self.__jaccard_method: str = jaccard_method
+
+    def run(self, processes: int = 1) -> NMFResults:
+        """Get mean relevance for all ranks in k_values."""
+        results: List[NMFSingleResult] = [self._run_for_k(k) for k in self.k_values]
+        return NMFResults(results, self.decomposer.data)
+
+    def _run_for_k(self, k: int) -> NMFSingleResult:
+        """Pairwise relevance for all models for rank k."""
+        models: List[NMFModel] = self.decomposer.decompose(rank=k, n=self.iterations)
+        best_model: NMFModel = min(models, key=lambda p: p.model.reconstruction_err_)
+        with multiprocessing.Pool() as pool:
+            if not self.__best_model:
+                modules: List[pd.DataFrame] = list(map(self._modules, models))
+                relevances: List[float] = list(pool.starmap(self._relevance, combinations(modules, 2)))
+            else:
+                best_modules: pd.DataFrame = self._modules(best_model)
+                modules: List[pd.DataFrame] = list(map(self._modules, (x for x in models if x is not best_model)))
+                relevances: List[float] = list(pool.starmap(self._relevance,
+                                                            [(best_modules, x) for x in modules]))
+        return NMFSingleResult(
+            k=k,
+            metric=relevances,
+            connectivity=None,
+            model=best_model,
+            data=self.decomposer.data,
+            options=self.decomposer.options
+        )
+
+    def _modules(self, model: NMFModel) -> pd.DataFrame:
+        """Get LOOCD assignment of modules for a model."""
+        loocd_res: sig.SelectionResults = sig.LeaveOneOut(model=model, data=self.decomposer.data).select()
+        loocd_assign: pd.DataFrame = sig.ThresholdAssignment(loocd_res.measure, threshold=-0.05, cut_low=True).assign()
+        # return [loocd_assign[m][loocd_assign[m]].index for m in loocd_assign.columns]
+        return loocd_assign
+
+    def _relevance(self, a: pd.DataFrame, b: pd.DataFrame) -> float:
+        """Relevance for a pair of modules assignments."""
+        # Match up modules using Hungarian algorithm, with Jaccard dissimilarity as cost
+        js: np.ndarray = pairwise_distances(
+            a.T, b.T,
+            metric=lambda x, y: jaccard_score(x, y, average=self.jaccard_method)
+        )
+
+        if self.relevance_type == "paired":
+            # Used paired Jaccard rather than relevance
+            row_ind, col_ind = linear_sum_assignment(1 - js)
+            measure: float = mean(js[i][j] for i, j in zip(row_ind, col_ind))
+        else:
+            measure: float = mean(np.amax(js, axis=1))
+
+        return measure
 
 
 class NMFMultiSelect:
@@ -1300,53 +1445,115 @@ class NMFMultiSelect:
 
 
 class NMFResults:
-    """Provide results and output methods from the NMFModel selection process.
+    """Provide results for all the ranks searched by one NMFModelSelection method. Can produce plots of the values
+    across different ranks, and contains logic for suggesting suitable ranks.
     
     Public methods:
-    measure(plot_file, table_file)   -- Return cophenetic correlation for each value of k.
-                                                       Optionally output a plot and csv to file.
+    plot(summarise_methods,             -- produce a plot of model selection criteria over ranks searched, lines
+        suggestion_method)                indicating the summary methods provided, and highlighting the suggested
+                                          ranks from the suggestion method
+    suggest_ranks(suggestion_method)    -- suggest which ranks would be most suitable, return in a ranked order
+                                            (first most highly suggested) though it is important to check plots and
+                                            decompositions when making a final determination on rank.
+    table(summarise_methods)            -- table of the summarised rank metrics across all ranks
+    full_table()                        -- table of all results without summarising
+    results_for_k(k)                    -- get NMFSingleResult object for a single rank tested
+
 
     Instance variables:
-    results: List[NMFModelSelectionResults]         -- List of results, one for each value of k searched.
-    selected: NMFModelSelectionResults              -- Results for value of k for which the criteria was optimal.
-    data: DataFrame                                 -- Source data the model was learned from.
+    results: List[NMFSingleResult]      -- List of results, one for each value of k searched.
+    method: NMFModelSelection subclass  -- Class which produced the results. Used to provide default rank
+                                            suggestion methods.
     """
 
-    def __init__(self, results: List[NMFModelSelectionResults], data: pd.DataFrame = None,
-                 reduce_fn: Callable[[NMFModelSelectionResults, NMFModelSelectionResults], NMFModelSelectionResults]
-                 = lambda x, y: x if x.metric > y.metric else y) -> None:
+    def __init__(self,
+                 results: List[NMFSingleResult],
+                 method: Type[NMFModelSelection]
+                 ) -> None:
         """Initialise NMFResults.
 
         :param results: List of results objects, one for each value of k tested.
-        :type results: List[NMFModelSelectionResults]
-        :param data: Data which the model was learned from
-        :type data: DataFrame
+        :type results: List[NMFSingleResult]
         :param reduce_fn: Function to decide which k is optimal, reduce style function. By default reduces to highest.
         :type reduce_fn: Callable[[NMFModelSelectionResults, NMFModelSelectionResults], NMFModelSelectionResults]
         """
-        self.__results: List[NMFModelSelectionResults] = results
-        self.__data: pd.DataFrame = data
-        opt_k: NMFModelSelectionResults = reduce(
-            reduce_fn,
-            results
-        )
-        # select and store optimal k by cophenetic correlation
-        self.__selected: NMFModelSelectionResults = opt_k
+        self.__results: List[NMFSingleResult] = results
+        self.__method: Type[NMFModelSelection] = method
 
     @property
-    def results(self) -> List[NMFModelSelectionResults]:
+    def results(self) -> List[NMFSingleResult]:
         """Return results for all values of k tested."""
         return self.__results
 
-    @property
-    def selected(self) -> NMFModelSelectionResults:
-        """Return results for optimal k tested."""
-        return self.__selected
+    def results_for_k(self, k: int) -> NMFSingleResult:
+        """Fetch results for a single rank.
 
-    @property
-    def data(self) -> pd.DataFrame:
-        """Return the input data."""
-        return self.__data
+        :param k: Rank to fetch
+        :type k: int
+        :rtype: NMFSingleResult
+        """
+        return next(x for x in self.results if x.k == k)
+
+    def full_table(self) -> pd.DataFrame:
+        """Return a DataFrame with all values for all ranks searched."""
+        raise NotImplementedError
+
+    def table(self,
+              summarise_methods: Union[List[SummariseMethod], SummariseMethod] = MetricSummarise.MEAN.value
+              ) -> pd.DataFrame:
+        """Make a table with the summarised metrics for all ranks. Ranks on rows, methods on columns. Defaults to
+        arithmetic mean."""
+
+        summarise_methods = [MetricSummarise.MEAN.value] if summarise_methods is None else summarise_methods
+        summarise_methods = [summarise_methods] if not isinstance(summarise_methods, list) else summarise_methods
+        summarised: List[List[float]] = [[k.metric(method) for k in self.results] for method in summarise_methods]
+        df: pd.DataFrame = pd.DataFrame(summarised).T
+        df.index = [x.k for x in self.results]
+        df.columns = [x.name for x in summarise_methods]
+        return df
+
+    def plot(self,
+             summarise_methods: Union[List[SummariseMethod], SummariseMethod] = MetricSummarise.MEAN.value
+             ) -> go.Figure:
+        """Plot the values of model selection across ranks. Where multiple values are provide for a rank, produces a
+        boxplot with jittered points, and lines at the provided summarising method points. Where only one value is
+        available, plots only a line, ignoring summarise methods."""
+
+        fig: go.Figure = go.Figure()
+        for trace in self.traces(summarise_methods):
+            fig.add_trace(trace)
+        return fig
+
+    def traces(self,
+               summarise_methods: Union[List[SummariseMethod], SummariseMethod] = MetricSummarise.MEAN.value
+               ) -> List[go.Trace]:
+        """Get a set of traces which could be inserted into a plot to represent this model selection object."""
+
+        summarise_methods = [MetricSummarise.MEAN.value] if summarise_methods is None else summarise_methods
+        summarise_methods = [summarise_methods] if not isinstance(summarise_methods, list) else summarise_methods
+
+        # Z-order is boxplot, points, lines, suggestions
+        traces: List[go.Trace] = []
+        if len(self.results[0].all_metrics) > 1:
+            for result in self.results:
+                traces += [go.Violin(
+                    y=result.all_metrics,
+                    name=result.k,
+                    box_visible=True,
+                    showlegend=False,
+                    line_color="red",
+                    points="all"
+                )
+                ]
+        tbl: pd.DataFrame = self.table(summarise_methods)
+        for i, col in enumerate(tbl.columns):
+            traces += [go.Scatter(
+                y=tbl[col],
+                x=[x.k for x in self.results],
+                line_color=summarise_methods[i].plot_color,
+                name=col)
+            ]
+        return traces
 
     def measure(self, plot: str = None, table: str = None
                 ) -> pd.DataFrame:
@@ -1381,7 +1588,7 @@ class NMFResults:
             data.to_csv(table)
         return data
 
-    def result_for_k(self, k: int) -> NMFModelSelectionResults:
+    def result_for_k(self, k: int) -> NMFSingleResult:
         """Return the model selection results for the specified rank k. Useful for exporing ranks near the elbow
         points to identify nost suitable rank.
 
@@ -1414,8 +1621,11 @@ class NMFResults:
         return load(file)
 
 
-class NMFModelSelectionResults:
-    """Contain results from NMFModel selection process.
+class NMFSingleResult:
+    """Contains rank selection results from an NMFRankSelection class for a single value of k. Some return only a
+    single value, others return multiple values. The model stored is the decomposition with lowest reconstruction
+    error learnt. Where multiple results are returned, the default method to summarise them to a single value is
+    arithmetic mean.
 
     Public methods:
     write_w             -- Write W matrix to file
@@ -1425,33 +1635,37 @@ class NMFModelSelectionResults:
 
     Instance variables:
     k: int              -- number of components
-    metric: float       -- value of the model selectiom metric for this number of components
+    metric:             -- value of the model selectiom metric for this number of components
+        Union[List[float], float]
     connectivity:       -- connectivity matrix for consensus based metrics
-        ConnectivityMatrix
-    h: DataFrame        -- h matrix of model for this k
-    w: DataFrame        -- w matrix of model for this k
-    model: NMF/wNMF     -- model with lowest reconstruction error for this k
-    data: DataFrame     -- data this model was built from
+        Optional[pd.DataFrame]
+    model: NMFModel     -- model with lowest reconstruction error
+    metric_summarise:   -- default method to summarise this rank selection method
+        Callable[[List[float]], float]
     """
 
+    # TODO: Make each rank selection method know how to plot itself - property which can be set as function?
+    # TODO: Implement knee/elbow finding to identify candidate ranks (maybe different for each method)
+    # TODO: Weight Jaccard similarity by distance to best model / data?
     def __init__(self,
                  k: int,
-                 cophenetic_corr: float,
+                 metric: Union[List[float], float],
                  connectivity: Optional[pd.DataFrame],
-                 w: Optional[pd.DataFrame],
-                 h: Optional[pd.DataFrame],
                  model: Optional[NMFModel],
-                 data: pd.DataFrame) -> None:
+                 data: pd.DataFrame,
+                 options: NMFOptions,
+                 default_summarise: SummariseMethod = MetricSummarise.MEAN.value
+                 ) -> None:
         """Create for NMFModelResults.
 
         :param k: Value of k tested
         :type k: int
-        :param cophenetic_corr: Value of the criteria for this test. While this is named cophenetic corr, will be
+        :param metric: Value of the criteria for this test. While this is named cophenetic corr, will be
                                 whichever criteria is appropriate for the method.
-        :type cophenetic_corr: float
+        :type metric: float
         :param connectivity: Connectivity matrix across iterations. Will return none for methods which do not use
                              connectivity matrices.
-        :type connectivity: DataFrame
+        :type connectivity: pd.DataFrame
         :param w: The W matrix of the model
         :type w: DataFrame
         :param h: The H matrix of the model
@@ -1460,25 +1674,21 @@ class NMFModelSelectionResults:
         :type model: NMF
         :param data: Data which the model was learned from
         :type data: DataFrame
+        :param options: Options used during learning
+        :type options: NMFOptions
         """
         self.__k: int = k
-        self.__metric: float = cophenetic_corr
-        self.__connectivity: pd.DataFrame = connectivity
-        self.__w: pd.DataFrame = w
-        self.__h: pd.DataFrame = h
+        self.__metrics: Union[List[float], float] = metric
+        self.__connectivity: Optional[pd.DataFrame] = connectivity
         self.__model: Optional[NMFModel] = model
         self.__data: pd.DataFrame = data
-        self.__name_dfs()
+        self.__options: NMFOptions = options
+        self.__default_summarise: SummariseMethod = default_summarise
 
     @property
     def k(self) -> int:
         """Return k value for these results."""
         return self.__k
-
-    @property
-    def metric(self) -> float:
-        """Return selection metric for this k."""
-        return self.__metric
 
     @property
     def connectivity(self) -> pd.DataFrame:
@@ -1488,12 +1698,12 @@ class NMFModelSelectionResults:
     @property
     def h(self) -> pd.DataFrame:
         """Return w matrix of NMF for this k."""
-        return self.__h
+        return self.model.h
 
     @property
     def w(self) -> pd.DataFrame:
         """Return h matrix of NMF for this k."""
-        return self.__w
+        return self.model.w(self.data)
 
     @property
     def model(self) -> NMFModel:
@@ -1505,26 +1715,30 @@ class NMFModelSelectionResults:
         """Return the source data."""
         return self.__data
 
+    @property
+    def all_metrics(self) -> List[float]:
+        return self.__metrics if isinstance(self.__metrics, list) else [self.__metrics]
+
+    def metric(self, summarise: SummariseMethod = None) -> float:
+        """Return selection metric for this k. Where there are multiple values for the method, use summarise to provide
+        a function which reduces this to a single value. This defaults to arithmetic mean.
+
+        :param summarise: Function to reduce list of values to a single summarised value. Defaults to arithmetic mean.
+        :type summarise: Callable[[Iterable[float]], float]
+        :return: Single measure of rank suitability
+        :rtype: float
+
+        """
+        return summarise.function(self.all_metrics) if summarise is not None else self.__default_summarise.function(self.__metrics)
+
     def __str__(self) -> str:
         """Return string representation of this object."""
-        return f'{self.k},{self.metric}'
+        return self.__repr__()
 
     def __repr__(self) -> str:
         """Return representation of the this object."""
-        return f'<{str(self)}>'
-
-    def __name_dfs(self) -> None:
-        """Give the indices W, H the correct names."""
-        # W
-        if self.__w is not None:
-            self.__w.columns = NMFDecomposer.component_names(self.k)
-            self.__w.columns.name = 'modules'
-            self.__w.index.name = self.__data.index.name
-        # H
-        if self.__h is not None:
-            self.__h.index = NMFDecomposer.component_names(self.k)
-            self.__h.index.name = 'modules'
-            self.__h.columns.name = self.__data.columns.name
+        return (f'NMFSingleResult('
+                f'k={self.k}, metric={self.metric()})')
 
     @staticmethod
     def _write_df(df: pd.DataFrame, file: str = None) -> None:
@@ -1589,7 +1803,7 @@ class NMFModelSelectionResults:
         dump(self, file, compress=True)
 
     @classmethod
-    def load_model(cls, file: str) -> NMFModelSelectionResults:
+    def load_model(cls, file: str) -> NMFSingleResult:
         """Restore the results from a model file and data."""
         return load(file)
 
@@ -1776,38 +1990,55 @@ def tests() -> None:
 
 def orientation_tests():
     # Make some synthetic data to play with
-    data: pd.DataFrame = synthdata.sparse_overlap_even(rank=12, m_overlap=0.3, n_overlap=0.3,
-                                                     size=(2000, 100), noise=(0,4), p_ubiq=0.0, feature_scale=True)
+    data: pd.DataFrame = synthdata.sparse_overlap_even(rank=18, m_overlap=0.3, n_overlap=0.3,
+                                                     size=(500, 200), noise=(0,3), p_ubiq=0.0, feature_scale=True)
     # Transpose to sk-learn orientation
     data = data.T
+    # Five comm simulation
+    data: pd.DataFrame = pd.read_csv("~/Dropbox/PHD/FunctionalAbundance/paper/figures/simulations/five/ko_table.tsv",
+                                   sep="\t", index_col=0)
+    data = (data / data.sum(axis=0)).fillna(0).T
+    # Leukemia data - classic dataset
+    data = pd.read_csv("~/Dropbox/PHD/FunctionalAbundance/paper/figures/external_data/leukemia/leukemia_data.tsv", index_col=0, sep="\t")
+    data = (data / data.sum(axis=0)).fillna(0).T
+    print(data)
     # plt.show()
     # sel: NMFModelSelection = NMFConsensusSelection(data, k_values=[2,6], solver='mu', beta_loss='kullback-leibler',
     #                                            iterations=10)
     opts = NMFOptions(
         nmf_max_iter=3000,
-        filter_fn=normalise.variance_filter,
-        filter_threshold=0.5,
-        normalise=normalise.map_maximum,
-        normalise_arg=None
+        # filter_fn=normalise.variance_filter,
+        # filter_threshold=0.1,
+        # normalise=norm.map_maximum,
+        # normalise_arg=None
     )
     decomposer = NMFDecomposer(
         data=data,
         options=opts,
-        seed=7297108
+        seed=5345432235
     )
-    sel: NMFModelSelection = NMFConcordanceSelection(
-        k_values=[9,10,11,12,13,14,15,16], iterations=5, decomposer=decomposer
+    # if os.path.exists("decomposer.pickle"):
+    #     with open("decomposer.pickle", 'rb') as f:
+    #         decomposer = pickle.load(f)
+    sel: NMFModelSelection = NMFLOOCDSelection(
+        k_values=list(range(2, 12)), iterations=100, decomposer=decomposer, jaccard_method="binary",
+        relevance_type="paired", best_model=True
     )
-    sel2: NMFModelSelection = NMFConsensusSelection(
-        k_values=[9,10,11,12,13,14,15,16], iterations=5, decomposer=decomposer
-    )
+    # sel2: NMFModelSelection = NMFConsensusSelection(
+    #     k_values=list(range(5, 8)), iterations=50, decomposer=decomposer
+    # )
     res1 = sel.run()
-    res2 = sel2.run()
+    with open("decomposer.pickle", 'wb') as f:
+        pickle.dump(decomposer, f)
     # res2 = sel2.run()
-    res1 == res2
+    # res2 = sel2.run()
+    # res1 == res2
     print(res1.results)
-    print(res2[0].results)
-    print(res2[1].results)
+    res1.table()
+    figg = res1.plot([MetricSummarise.MEAN.value, MetricSummarise.MEDIAN.value])
+    figg.show()
+    # print(res2[0].results)
+    # print(res2[1].results)
 
 def leukemia():
     pass
