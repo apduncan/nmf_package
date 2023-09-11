@@ -34,7 +34,7 @@ from scipy.optimize import linear_sum_assignment
 from sklearn.decomposition import NMF
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import pairwise_distances, adjusted_rand_score, jaccard_score
-from wNMF import wNMF
+# from wNMF import wNMF
 
 # Local imports
 from mg_nmf.nmf import normalise as norm, synthdata as synthdata, signature as sig
@@ -1238,6 +1238,24 @@ class NMFLOOCDSelection(NMFModelSelection):
     def jaccard_method(self, jaccard_method: str) -> None:
         self.__jaccard_method: str = jaccard_method
 
+    def interank_relevance(self, results: NMFResults) -> pd.DataFrame:
+        """Find the relevance between decomposition with rank k and k+1. Where relevance remains high, all modules in
+        the lower rank decomposition are found in the higher rank decomposition, suggesting it does not capture
+        significant additional structure."""
+        # TODO: Restructure this, it doesn't really belong here, and we calculate LOOCD multiple times
+
+        rels: List[Tuple[int, int, float]] = []
+        for k in range(len(results.results) - 1):
+            k_1: int = k + 1
+            a, b = results.results[k].model, results.results[k_1].model
+            a_mod, b_mod = list(map(self._modules, [a, b]))
+            # Have to use relevance rather than paired, as uneven number off modules in this case
+            relevance: float = self._relevance(b_mod, a_mod, relevance_type="relevance")
+            rels.append((k, k_1, relevance))
+        res_df: pd.DataFrame = pd.DataFrame(rels, columns=['k', 'k_1', 'relevance'])
+        return res_df
+
+
     def run(self, processes: int = 1) -> NMFResults:
         """Get mean relevance for all ranks in k_values."""
         results: List[NMFSingleResult] = [self._run_for_k(k) for k in self.k_values]
@@ -1272,15 +1290,15 @@ class NMFLOOCDSelection(NMFModelSelection):
         # return [loocd_assign[m][loocd_assign[m]].index for m in loocd_assign.columns]
         return loocd_assign
 
-    def _relevance(self, a: pd.DataFrame, b: pd.DataFrame) -> float:
+    def _relevance(self, a: pd.DataFrame, b: pd.DataFrame, relevance_type: Optional[str] = None) -> float:
         """Relevance for a pair of modules assignments."""
         # Match up modules using Hungarian algorithm, with Jaccard dissimilarity as cost
         js: np.ndarray = pairwise_distances(
             a.T, b.T,
             metric=lambda x, y: jaccard_score(x, y, average=self.jaccard_method)
         )
-
-        if self.relevance_type == "paired":
+        rel_use: str = self.relevance_type if relevance_type is None else relevance_type
+        if relevance_type == "paired":
             # Used paired Jaccard rather than relevance
             row_ind, col_ind = linear_sum_assignment(1 - js)
             measure: float = mean(js[i][j] for i, j in zip(row_ind, col_ind))
@@ -1513,19 +1531,21 @@ class NMFResults:
         return df
 
     def plot(self,
-             summarise_methods: Union[List[SummariseMethod], SummariseMethod] = MetricSummarise.MEAN.value
+             summarise_methods: Union[List[SummariseMethod], SummariseMethod] = MetricSummarise.MEAN.value,
+             sliding_loocd: bool = True
              ) -> go.Figure:
         """Plot the values of model selection across ranks. Where multiple values are provide for a rank, produces a
         boxplot with jittered points, and lines at the provided summarising method points. Where only one value is
         available, plots only a line, ignoring summarise methods."""
 
         fig: go.Figure = go.Figure()
-        for trace in self.traces(summarise_methods):
+        for trace in self.traces(summarise_methods, sliding_loocd=sliding_loocd):
             fig.add_trace(trace)
         return fig
 
     def traces(self,
-               summarise_methods: Union[List[SummariseMethod], SummariseMethod] = MetricSummarise.MEAN.value
+               summarise_methods: Union[List[SummariseMethod], SummariseMethod] = MetricSummarise.MEAN.value,
+               sliding_loocd: bool = True
                ) -> List[go.Trace]:
         """Get a set of traces which could be inserted into a plot to represent this model selection object."""
 
@@ -1533,6 +1553,7 @@ class NMFResults:
         summarise_methods = [summarise_methods] if not isinstance(summarise_methods, list) else summarise_methods
 
         # Z-order is boxplot, points, lines, suggestions
+        # Vioin plots
         traces: List[go.Trace] = []
         if len(self.results[0].all_metrics) > 1:
             for result in self.results:
@@ -1545,6 +1566,8 @@ class NMFResults:
                     points="all"
                 )
                 ]
+
+        # Summarised lines
         tbl: pd.DataFrame = self.table(summarise_methods)
         for i, col in enumerate(tbl.columns):
             traces += [go.Scatter(
@@ -1553,6 +1576,36 @@ class NMFResults:
                 line_color=summarise_methods[i].plot_color,
                 name=col)
             ]
+
+        # Should only really be calculated for LOOCD results
+        # TODO: Refactor so we can distinguish which method these came from
+        if sliding_loocd:
+            loocd_selector: NMFLOOCDSelection = NMFLOOCDSelection(
+                relevance_type="relevance", jaccard_method="binary",
+                decomposer=NMFDecomposer(data=self.results[0].data,
+                                         options=NMFOptions())
+            )
+            first_k: int = self.results[0].k
+            slide: pd.DataFrame = loocd_selector.interank_relevance(self)
+            # Compose a line trace with None to break lines
+            x: List[int] = list(
+                itertools.chain.from_iterable(
+                    map(
+                        lambda x: (first_k + x[1]['k'],first_k + x[1]['k_1'], None),
+                        slide.iterrows()
+                    )
+                )
+            )
+            y: List[float] = list(itertools.chain.from_iterable(map(lambda x: (x[1]['relevance'], x[1]['relevance'], None), slide.iterrows())))
+            traces += [go.Scatter(
+                x=x,
+                y=y,
+                line_color="black",
+                line_dash="dash",
+                name="best model relevance",
+                visible="legendonly"
+            )]
+
         return traces
 
     def measure(self, plot: str = None, table: str = None
@@ -1990,17 +2043,17 @@ def tests() -> None:
 
 def orientation_tests():
     # Make some synthetic data to play with
-    data: pd.DataFrame = synthdata.sparse_overlap_even(rank=18, m_overlap=0.3, n_overlap=0.3,
+    data: pd.DataFrame = synthdata.sparse_overlap_even(rank=14, m_overlap=0.3, n_overlap=0.3,
                                                      size=(500, 200), noise=(0,3), p_ubiq=0.0, feature_scale=True)
     # Transpose to sk-learn orientation
     data = data.T
     # Five comm simulation
-    data: pd.DataFrame = pd.read_csv("~/Dropbox/PHD/FunctionalAbundance/paper/figures/simulations/five/ko_table.tsv",
-                                   sep="\t", index_col=0)
-    data = (data / data.sum(axis=0)).fillna(0).T
+    # data: pd.DataFrame = pd.read_csv("~/Dropbox/PHD/FunctionalAbundance/paper/figures/simulations/mosaic/ko_table.tsv",
+    #                                sep="\t", index_col=0)
+    # data = (data / data.sum(axis=0)).fillna(0).T
     # Leukemia data - classic dataset
-    data = pd.read_csv("~/Dropbox/PHD/FunctionalAbundance/paper/figures/external_data/leukemia/leukemia_data.tsv", index_col=0, sep="\t")
-    data = (data / data.sum(axis=0)).fillna(0).T
+    # data = pd.read_csv("~/Dropbox/PHD/FunctionalAbundance/paper/figures/external_data/leukemia/leukemia_data.tsv", index_col=0, sep="\t")
+    # data = (data / data.sum(axis=0)).fillna(0).T
     print(data)
     # plt.show()
     # sel: NMFModelSelection = NMFConsensusSelection(data, k_values=[2,6], solver='mu', beta_loss='kullback-leibler',
@@ -2021,7 +2074,7 @@ def orientation_tests():
     #     with open("decomposer.pickle", 'rb') as f:
     #         decomposer = pickle.load(f)
     sel: NMFModelSelection = NMFLOOCDSelection(
-        k_values=list(range(2, 12)), iterations=100, decomposer=decomposer, jaccard_method="binary",
+        k_values=list(range(10, 19)), iterations=50, decomposer=decomposer, jaccard_method="binary",
         relevance_type="paired", best_model=True
     )
     # sel2: NMFModelSelection = NMFConsensusSelection(
@@ -2035,7 +2088,7 @@ def orientation_tests():
     # res1 == res2
     print(res1.results)
     res1.table()
-    figg = res1.plot([MetricSummarise.MEAN.value, MetricSummarise.MEDIAN.value])
+    figg = res1.plot([MetricSummarise.MEAN.value, MetricSummarise.MEDIAN.value], sliding_loocd=True)
     figg.show()
     # print(res2[0].results)
     # print(res2[1].results)
