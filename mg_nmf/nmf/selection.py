@@ -5,10 +5,12 @@ Initially designed for use on """
 from __future__ import annotations
 
 import itertools
-import os.path
+import math
+import os
 import pickle
 from itertools import combinations, starmap
 from abc import ABC, abstractmethod
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 from functools import reduce
@@ -19,6 +21,7 @@ from statistics import mean, median
 from typing import List, Tuple, Dict, Callable, Union, Optional, Iterable, NamedTuple, Set, Type
 import warnings
 
+import kneed
 # Dependency imports
 from joblib import dump, load
 import matplotlib.pyplot as plt
@@ -29,15 +32,19 @@ import seaborn as sns
 import scipy.cluster.hierarchy as hierarchy
 import scipy.spatial.distance as distance
 import scipy.optimize as optimize
+from plotly.subplots import make_subplots
 from scipy import stats
 from scipy.optimize import linear_sum_assignment
+from scipy.signal import argrelextrema
 from sklearn.decomposition import NMF
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import pairwise_distances, adjusted_rand_score, jaccard_score
-# from wNMF import wNMF
+from wNMF import wNMF
 
 # Local imports
 from mg_nmf.nmf import normalise as norm, synthdata as synthdata, signature as sig
+
+
 # from mg_nmf.nmf.signature import LeaveOneOut, SelectionResults, ThresholdAssignment
 
 
@@ -68,10 +75,12 @@ class SummariseMethod(NamedTuple):
     function: Callable[[List[float]], float]
     plot_color: str
 
+
 class MetricSummarise(Enum):
     """Convenience function to provide methods to summarise multiple metrics."""
     MEAN: SummariseMethod = SummariseMethod("mean", mean, "black")
     MEDIAN: SummariseMethod = SummariseMethod("median", median, "grey")
+
 
 class NMFModel(NamedTuple):
     """Filtering can lead to a model being fit on a subset of features. This class stores both the model, and
@@ -190,7 +199,6 @@ class NMFOptions:
                 raise Exception(f'Value {beta_loss} for solver now allowed, must be one of {BetaLoss}')
         self.__beta_loss: BetaLoss = beta_loss
 
-
     @property
     def normalise(self) -> Callable[[pd.DataFrame, float], pd.DataFrame]:
         """Function used to map each column of W to a value to normalise W & H by."""
@@ -249,14 +257,14 @@ class NMFOptions:
     def __repr__(self):
         vals: str = ", ".join(
             filter(lambda x: x is not None,
-                [f'solver={self.solver.value}',
-                 f'beta_loss={self.beta_loss.value}'
-                 f'nmf_max_iter={self.__nmf_max_iter}',
-                 f'normalise={self.normalise}' if self.normalise is not None else None,
-                 f'normalise_args={self.normalise_arg}' if self.normalise_arg is not None else None,
-                 f'filter={self.filter}' if self.filter is not None else None,
-                 f'filter_arg={self.filter_threshold}' if self.filter_threshold is not None else None]
-            )
+                   [f'solver={self.solver.value}',
+                    f'beta_loss={self.beta_loss.value}'
+                    f'nmf_max_iter={self.__nmf_max_iter}',
+                    f'normalise={self.normalise}' if self.normalise is not None else None,
+                    f'normalise_args={self.normalise_arg}' if self.normalise_arg is not None else None,
+                    f'filter={self.filter}' if self.filter is not None else None,
+                    f'filter_arg={self.filter_threshold}' if self.filter_threshold is not None else None]
+                   )
         )
         return f'NMFOptions({vals})'
 
@@ -349,7 +357,7 @@ class NMFDecomposer:
         if self.data is not None:
             rows, cols = self.data.shape
             if rows > cols:
-                warnings.warn('Data orientation may be incorrect. Input matrix X should have features on columns, ' 
+                warnings.warn('Data orientation may be incorrect. Input matrix X should have features on columns, '
                               'samples on rows. sk-learn orientation is transposed from majority of NMF literature.')
 
     @staticmethod
@@ -425,7 +433,7 @@ class NMFDecomposer:
             # Filter
             u: pd.DataFrame = self.options.filter(h_norm, self.options.filter_threshold)
             # Reduce H to the restricted list
-            h = h.loc[:,list(u.columns)]
+            h = h.loc[:, list(u.columns)]
         h.index.name = "modules"
         return h
 
@@ -546,6 +554,12 @@ class NMFModelSelection(ABC):
     BETA_LOSS: List[str] = ['frobenius', 'kullback-leibler', 'itakura-saito']
     INIT: List[str] = ['random', 'nndsvd', 'nndsvda', 'nndsvdar']
 
+    # Local classes to keep data more tidy and readable
+    class MetricResults(NamedTuple):
+        name: str
+        color: str
+        metric: NMFResults
+
     def __init__(self,
                  decomposer: NMFDecomposer,
                  k_min: int = None,
@@ -576,6 +590,7 @@ class NMFModelSelection(ABC):
         self.metric = self.metrics[-1] if metric is None else metric
         self.weighting = None
         self.__decomposer: NMFDecomposer = decomposer
+        self._results: Optional[List[NMFModelSelection.MetricResults]] = None
         self.iterations = iterations
 
     @property
@@ -630,7 +645,7 @@ class NMFModelSelection(ABC):
 
     def __compose_k_values(self) -> List[int]:
         """Make a list of values of k to be searched from min, max and interval."""
-        return list(range(self.k_min, self.k_max+1, self.k_interval))
+        return list(range(self.k_min, self.k_max + 1, self.k_interval))
 
     @property
     def metric(self):
@@ -667,6 +682,199 @@ class NMFModelSelection(ABC):
         """Run process for model selection of NMF."""
         pass
 
+    def plot(self, suggest_size: int = 5) -> go.Figure:
+        """Make a plot summarising the results. One subplot per metric evaluated."""
+        if self._results is None:
+            raise ValueError("No results found, has selection been run with .run()?")
+        num_plots: int = len(self._results)
+        fig: go.Figure = make_subplots(
+            rows=1,
+            cols=num_plots,
+            subplot_titles=list(map(lambda x: x.name, self._results))
+        )
+        for i, res in enumerate(self._results):
+            fig.add_traces(self.traces(res), rows=1, cols=i + 1, suggest_size=suggest_size)
+        return fig
+
+    def traces(self, result: NMFModelSelection.MetricResults, suggest_size: int = 5) -> List[go.Trace]:
+        """Produces traces for the specified metric which can be added to a plotly Figure to represent these results.
+        Provides traces so they can be added to a plotly subplot layout."""
+
+        # Z-order is boxplot, points, lines, suggestions
+        # Vioin plots
+        traces: List[go.Trace] = []
+        x: List[int] = [x.k for x in result.metric.results]
+        suggestions: List[int] = self.suggest_ranks(result)
+        suggestion_chr: List[str] = list(map(lambda i: "diamond" if i in suggestions else "circle", x))
+        suggestion_chr[suggestions[0] - x[0]] = "star"
+        suggestion_size: List[int] = [suggest_size if i in suggestions else 0 for i in x]
+        suggestion_size[suggestions[0] - x[0]] = suggest_size * 2
+        if len(result.metric.results[0].all_metrics) > 1:
+            for k_res in result.metric.results:
+                traces += [go.Violin(
+                    y=k_res.all_metrics,
+                    name=k_res.k,
+                    box=dict(visible=True),
+                    showlegend=False,
+                    line=dict(color=result.color),
+                    points="all"
+                )
+                ]
+
+            # Summarised lines - mean and median
+            sum_methods = [("mean", mean), ("median", median)]
+            for method_name, method_function in sum_methods:
+                ranks_summarised: List[Tuple[int, float]] = [(x.k, method_function(x.all_metrics))
+                                                             for x in result.metric.results]
+                traces += [go.Scatter(
+                    y=[x[1] for x in ranks_summarised],
+                    x=[x[0] for x in ranks_summarised],
+                    line_color="grey" if method_name == "median" else "black",
+                    name=method_name,
+                    marker=dict(
+                        symbol=suggestion_chr,
+                        size=suggestion_size,
+                        line=dict(color="black")
+                    )
+                )]
+        else:
+            # Single points only
+            traces += [go.Scatter(
+                y=[x.all_metrics[0] for x in result.metric.results],
+                x=[x.k for x in result.metric.results],
+                line=dict(color=result.color),
+                name=result.name,
+                marker=dict(
+                    symbol=suggestion_chr,
+                    line=dict(color="black"),
+                    size=suggestion_size
+                )
+            )]
+
+        # Should only really be calculated for LOOCD results
+        # if sliding_loocd:
+        #     loocd_selector: NMFLOOCDSelection = NMFLOOCDSelection(
+        #         relevance_type="relevance", jaccard_method="binary",
+        #         decomposer=NMFDecomposer(data=self.results[0].data,
+        #                                  options=NMFOptions())
+        #     )
+        #     first_k: int = self.results[0].k
+        #     slide: pd.DataFrame = loocd_selector.interank_relevance(self)
+        #     # Compose a line trace with None to break lines
+        #     x: List[int] = list(
+        #         itertools.chain.from_iterable(
+        #             map(
+        #                 lambda x: (first_k + x[1]['k'], first_k + x[1]['k_1'], None),
+        #                 slide.iterrows()
+        #             )
+        #         )
+        #     )
+        #     y: List[float] = list(itertools.chain.from_iterable(
+        #         map(lambda x: (x[1]['relevance'], x[1]['relevance'], None), slide.iterrows())))
+        #     traces += [go.Scatter(
+        #         x=x,
+        #         y=y,
+        #         line_color="black",
+        #         line_dash="dash",
+        #         name="best model relevance",
+        #         visible="legendonly"
+        #     )]
+
+        return traces
+
+    def suggest_ranks(self, metric: NMFModelSelection.MetricResults) -> List[int]:
+        """Suggest which rank would be the most suitable decomposition. Returns an ordered list, with the first being
+        the best suggestion. This uses a variety of heuristics to identify suitable ranks. It remains worthwhile to
+        visually inspect model selection criteria plots, and decompositions at different ranks, to make a final
+        selection. These methods make use of the kneed package to identify knee/elbow points. """
+
+        # Detect which method to use (single/multi)
+        if len(metric.metric.results[0].all_metrics) == 1:
+            return self.__suggest_sinlge(metric)
+        else:
+            return self.__suggest_multi(metric)
+
+    def __suggest_sinlge(self, metric: NMFModelSelection.MetricResults, y: Optional[List[float]] = None) -> List[int]:
+        """Suggest ranks based on a single curve. If y is specified, will use this array of y-values rather than
+        getting them from the metric object. Use this when passing a summarised curve (mean/median)."""
+
+        x: List[int] = [x.k for x in metric.metric.results]
+        y: List[float] = [x.metric() for x in metric.metric.results] if y is None else y
+
+        # Look for concave-increasing knees and concave-decreasing knees
+        conc_inc: kneed.KneeLocator = kneed.KneeLocator(
+            x=x,
+            y=y,
+            curve="concave",
+            direction="increasing",
+            online=True
+        )
+        conc_dec: kneed.KneeLocator = kneed.KneeLocator(
+            x=x,
+            y=y,
+            curve="concave",
+            direction="decreasing",
+            online=True
+        )
+        conc_inc_lst: List[int] = sorted(conc_inc.all_knees)
+        conc_dec_lst: List[int] = sorted(conc_dec.all_knees)
+        # Discard concave-decreasing knee if it is greater than the first concave-increasing
+        candidates = conc_inc_lst if conc_dec_lst[0] > conc_inc_lst[0] else [conc_dec_lst[0]] + list(conc_inc.all_knees)
+
+        # Look for local maxima
+        local_maxima: np.array = argrelextrema(np.float32(y), np.greater)[0]
+        # Apply some tolerance, so we're not picking up tiny bumps in the value
+        # Defaulting to 1% of total range
+        tol: float = (max(y) - min(y)) * 0.01
+        local_maxima = list(filter(
+            lambda i: ((y[i] - y[i-1]) > tol) and ((y[i] - y[i+1]) > tol),
+            local_maxima
+        ))
+        # Any local maxima has to be an improvement on the prior
+        increasing_maxima: List[int] = []
+        curr_max: float = -np.inf
+        for i_max in local_maxima:
+            val: float = y[i_max]
+            if val > curr_max:
+                increasing_maxima.append(i_max)
+                curr_max = val
+
+        local_maxima = [i + x[0] for i in increasing_maxima]
+
+        # Discard knees if they after a local maxima
+        candidates = list(filter(lambda x: not(x - 1 in local_maxima), candidates))
+        candidates += local_maxima
+
+        # With multiple candidates, sort by the number of times occurs in list (both knee and local maximum)
+        # Break ties by proximity to elbow point in reconstruction error difference graph
+        candidate_df: pd.DataFrame = pd.DataFrame(Counter(candidates).items(), columns=['rank', 'count'])
+        candidate_df['error'] = candidate_df['rank'].map(
+            lambda x: metric.metric.result_for_k(x).model.model.reconstruction_err_)
+        error_knee: int = kneed.KneeLocator(x=x,
+                                        y=[x.model.model.reconstruction_err_ for x in metric.metric.results],
+                                        curve="convex",
+                                        direction="decreasing",
+                                        interp_method="polynomial"
+                                       ).knee
+        candidate_df['error_knee_dist'] = abs(candidate_df['rank'] - error_knee)
+        candidate_df = candidate_df.sort_values(by=['error_knee_dist', 'rank'], ascending=[True, True])
+        candidates = list(candidate_df['rank'])
+
+        return candidates
+
+    def __suggest_multi(self, metric: NMFModelSelection.MetricResults) -> List[int]:
+        """Suggest ranks where there are multiple measure values for each rank. Uses both mean and median for each rank,
+        and combines these results."""
+
+        # Run single suggestion for mean and median
+        for method in [mean, median]:
+            y: List[float] = [method(x.all_metrics) for x in metric.metric.results]
+            suggestions: List[int] = self.__suggest_sinlge(metric, y)
+
+        # Where suggestions from two averaging methods are within one rank, move these to the front of
+        # the list
+
+        raise NotImplemented
 
 # noinspection SpellCheckingInspection
 class NMFConsensusSelection(NMFModelSelection):
@@ -697,6 +905,17 @@ class NMFConsensusSelection(NMFModelSelection):
         # Process all the different runs for a value of k
         coph_res: List[NMFSingleResult] = [x[0] for x in results]
         disp_res: List[NMFSingleResult] = [x[1] for x in results]
+        coph_store: NMFModelSelection.MetricResults = NMFModelSelection.MetricResults(
+            name="coph",
+            color="#57e67d",
+            metric=NMFResults(coph_res, self.decomposer.data)
+        )
+        disp_store: NMFModelSelection.MetricResults = NMFModelSelection.MetricResults(
+            name="disp",
+            color="#02701f",
+            metric=NMFResults(disp_res, self.decomposer.data)
+        )
+        self._results = [coph_store, disp_store]
         if self.metric == 'cophenetic':
             return NMFResults(coph_res, self.decomposer.data)
         if self.metric == 'dispersion':
@@ -750,8 +969,10 @@ class NMFConsensusSelection(NMFModelSelection):
         w: pd.DataFrame = best_model.w(self.decomposer.data)
         w, h = self.decomposer.normalise(best_model, w)
         return (
-            NMFSingleResult(k, c, c_bar, w, h, best_model, self.decomposer.data),
-            NMFSingleResult(k, dispersion, c_bar, w, h, best_model, self.decomposer.data)
+            NMFSingleResult(k=k, metric=c, connectivity=c_bar, model=best_model, data=self.decomposer.data,
+                            options=self.decomposer.options, default_summarise=MetricSummarise.MEAN.value),
+            NMFSingleResult(k=k, metric=dispersion, connectivity=c_bar, model=best_model, data=self.decomposer.data,
+                            options=self.decomposer.options, default_summarise=MetricSummarise.MEAN.value),
         )
 
     def __repr__(self):
@@ -786,6 +1007,11 @@ class NMFConcordanceSelection(NMFModelSelection):
             kresults: NMFSingleResult = self._results_for_k(i, kmodels)
             results.append(kresults)
         print(f'[{time.strftime("%X")}] AGGREGATION COMPLETE')
+        self._results = [NMFModelSelection.MetricResults(
+            name="conc",
+            color="blue",
+            metric=NMFResults(results, self.decomposer.data)
+        )]
         # Process all the different runs for a value of k
         return NMFResults(results, self.decomposer.data)
 
@@ -846,7 +1072,15 @@ class NMFConcordanceSelection(NMFModelSelection):
         # Find mean of squared difference between best_S and S_j
         # ci = 1 - np.median(diffs)
         ci = 1 - np.mean(diffs)
-        return NMFSingleResult(k, ci, None, best_W, best_H, best_model, self.decomposer.data)
+        return NMFSingleResult(
+            k=k,
+            metric=ci,
+            connectivity=None,
+            model=best_model,
+            data=self.decomposer.data,
+            options=self.decomposer.options,
+            default_summarise=MetricSummarise.MEAN.value
+        )
 
 
 # noinspection SpellCheckingInspection
@@ -876,7 +1110,7 @@ class NMFSplitHalfSelection(NMFModelSelection):
         models: List[Tuple[Tuple[NMFModel, Optional[pd.DataFrame]], Tuple[NMFModel, Optional[pd.DataFrame]]]]
         for i in self.k_values:
             args += [i] * self.iterations
-            models = [self._run_split_for_k_single(x) for x in args]
+        models = [self._run_split_for_k_single(x) for x in args]
         results: List[NMFSingleResult] = []
         print(f'[{time.strftime("%X")}] ITERATIONS COMPLETE, AGGREGATING RESULTS')
         for i in self.k_values:
@@ -887,6 +1121,11 @@ class NMFSplitHalfSelection(NMFModelSelection):
             results.append(kresults)
         print(f'[{time.strftime("%X")}] AGGREGATION COMPLETE')
         # Process all the different runs for a value of k
+        self._results = [NMFModelSelection.MetricResults(
+            name="split",
+            color="#a318ad",
+            metric=NMFResults(results, self.decomposer.data)
+        )]
         return NMFResults(results, self.decomposer.data)
 
     def _run_split_for_k_single(self, k: int) \
@@ -929,8 +1168,15 @@ class NMFSplitHalfSelection(NMFModelSelection):
         ari_mean: float = np.mean(aris)
 
         # Can't return a model, as not trained on full data. Return all other parts of results.
-        return NMFSingleResult(k, ari_median, None, None, None, None,
-                               self.decomposer.data)
+        return NMFSingleResult(
+            k=k,
+            metric = aris,
+            connectivity=None,
+            model=None,
+            data=self.decomposer.data,
+            options=self.decomposer.options,
+            default_summarise=MetricSummarise.MEAN.value
+        )
 
 
 # noinspection SpellCheckingInspection
@@ -972,10 +1218,10 @@ class NMFPermutationSelection(NMFModelSelection):
                 NMFSingleResult(k=i,
                                 metric=proportion,
                                 connectivity=None,
-                                w=best_model.w(self.decomposer.data),
-                                h=best_model.h,
                                 model=best_model,
-                                data=self.decomposer.data)
+                                data=self.decomposer.data,
+                                options=self.decomposer.options
+                                )
             )
             resultobjs.append(resobj)
         print(f'[{time.strftime("%X")}] AGGREGATION COMPLETE')
@@ -987,6 +1233,11 @@ class NMFPermutationSelection(NMFModelSelection):
         print(f'[{time.strftime("%X")}] If stopping condition not met in high proportion of runs, ' +
               f'consider raising value of k search')
         # Process all the different runs for a value of k
+        self._results = [NMFModelSelection.MetricResults(
+            name="perm",
+            color="#5ad2d6",
+            metric=NMFResults(resultobjs, self.decomposer.data)
+        )]
         return NMFResults(resultobjs, self.decomposer.data)
 
     def _run_once(self, i: int) -> Tuple[Optional[NMFModel], Optional[int]]:
@@ -1006,7 +1257,7 @@ class NMFPermutationSelection(NMFModelSelection):
         recon_errs: List[Tuple[float, float]] = []
         for k in self.k_values:
             # Fetch i-th decomposition on regular data, and run on shuffled data
-            reg_model: NMFModel = self.decomposer.decompose(rank=k, n=i+1)[-1]
+            reg_model: NMFModel = self.decomposer.decompose(rank=k, n=i + 1)[-1]
             shuf_model: NMFModel = self.decomposer.for_data(shuffled).decompose(rank=k, n=1, cached=False)[0]
             # Calculate slope from k-1 to k for each
             # Below is code to manually calculate euclidean norm, no longer using, taking whatever distance specified
@@ -1193,7 +1444,7 @@ class NMFLOOCDSelection(NMFModelSelection):
                  jaccard_method: str = "weighted",
                  relevance_type: str = "paired",
                  best_model: bool = True
-    ) -> None:
+                 ) -> None:
         """Use stability of LOOCD modules across multiple random initialisations to select rank. Stability measured
         using Jaccard similarity. The two relevance types are "relevance", which takes highest score for each module
         in a pairwse comparison, and "paired" which matches modules using the Hungarian algorithm.
@@ -1255,11 +1506,15 @@ class NMFLOOCDSelection(NMFModelSelection):
         res_df: pd.DataFrame = pd.DataFrame(rels, columns=['k', 'k_1', 'relevance'])
         return res_df
 
-
     def run(self, processes: int = 1) -> NMFResults:
         """Get mean relevance for all ranks in k_values."""
         results: List[NMFSingleResult] = [self._run_for_k(k) for k in self.k_values]
-        return NMFResults(results, self.decomposer.data)
+        self._results = [NMFModelSelection.MetricResults(
+            name="loocd",
+            color="orange",
+            metric=NMFResults(results, self.decomposer.data)
+        )]
+        return NMFResults
 
     def _run_for_k(self, k: int) -> NMFSingleResult:
         """Pairwise relevance for all models for rank k."""
@@ -1325,11 +1580,11 @@ class NMFMultiSelect:
 
     # noinspection SpellCheckingInspection
     PERMITTED_METHODS: List[str] = [
-        'coph', 'disp', 'conc', 'perm', 'split', 'mse', 'mad'
+        'coph', 'disp', 'conc', 'perm', 'split', 'mse', 'mad', 'loocd'
     ]
 
     def __init__(self, ranks: List[int], methods: List[str] = None, iterations: int = None,
-                 nmf_max_iter: int = None, solver: str=None, beta_loss: str=None) -> None:
+                 nmf_max_iter: int = None, solver: str = None, beta_loss: str = None) -> None:
         """Initialise model selection using one or more of the available methods.
 
         :param ranks: values of k to search
@@ -1351,6 +1606,7 @@ class NMFMultiSelect:
         self.nmf_max_iter = nmf_max_iter
         self.solver = solver
         self.beta_loss = beta_loss
+        self._results = []
 
     @property
     def ranks(self) -> List[int]:
@@ -1416,51 +1672,115 @@ class NMFMultiSelect:
     # noinspection SpellCheckingInspection
     def run(self, data: pd.DataFrame, processes: int = 1) -> Dict[str, NMFResults]:
         """Run each of the selected methods for the provided data."""
+
+        options: NMFOptions = NMFOptions(
+            solver=Solver.MULTIPLICATIVE_UPDATE,
+            beta_loss=BetaLoss.KULLBACK_LEIBLER,
+            nmf_max_iter=self.nmf_max_iter
+        )
+        decomposer: NMFDecomposer = NMFDecomposer(
+            data=data,
+            options=options,
+            cache=True,
+            processes=processes,
+        )
+
         res: Dict[str, NMFResults] = {}
+        msel_res: List[NMFModelSelection] = []
 
         if 'coph' in self.methods or 'disp' in self.methods:
-            sel_coph: NMFModelSelection = NMFConsensusSelection(data, k_values=self.ranks, solver=self.solver,
-                                                                beta_loss=self.beta_loss, iterations=self.iterations,
-                                                                nmf_max_iter=self.nmf_max_iter)
+            sel_coph: NMFModelSelection = NMFConsensusSelection(
+                decomposer=decomposer,
+                k_values=self.ranks,
+                iterations=self.iterations,
+            )
             coph, disp = sel_coph.run(processes)
             res['coph'] = coph
             res['disp'] = disp
+            msel_res.append(sel_coph)
 
         if 'conc' in self.methods:
-            sel_conc: NMFModelSelection = NMFConcordanceSelection(data, k_values=self.ranks, solver=self.solver,
-                                                                   beta_loss=self.beta_loss, iterations=self.iterations,
-                                                                   nmf_max_iter=self.nmf_max_iter)
+            sel_conc: NMFModelSelection = NMFConcordanceSelection(
+                decomposer=decomposer,
+                k_values=self.ranks,
+                iterations=self.iterations
+            )
             conc = sel_conc.run(processes)
             res['conc'] = conc
+            msel_res.append(sel_conc)
 
         if 'perm' in self.methods:
-            sel_perm: NMFModelSelection = NMFPermutationSelection(data, k_values=self.ranks,
-                                                                  solver=self.solver,
-                                                                  beta_loss=self.beta_loss, iterations=self.iterations,
-                                                                  nmf_max_iter=self.nmf_max_iter)
+            sel_perm: NMFModelSelection = NMFPermutationSelection(
+                decomposer=decomposer,
+                k_values=self.ranks,
+                iterations=self.iterations
+            )
             perm = sel_perm.run(processes)
             res['perm'] = perm
+            msel_res.append(sel_perm)
 
         if 'split' in self.methods:
-            sel_split: NMFModelSelection = NMFSplitHalfSelection(data, k_values=self.ranks,
-                                                                 solver=self.solver,
-                                                                 beta_loss=self.beta_loss, iterations=self.iterations,
-                                                                 nmf_max_iter=self.nmf_max_iter)
+            sel_split: NMFModelSelection = NMFSplitHalfSelection(
+                decomposer=decomposer,
+                k_values=self.ranks,
+                iterations=self.iterations
+            )
             split = sel_split.run(processes)
             res['split'] = split
+            msel_res.append(sel_split)
 
-        if 'mse' in self.methods or 'mad' in self.methods:
-            sel_impute: NMFModelSelection = NMFImputationSelection(data, k_values=self.ranks,
-                                                                   solver=self.solver,
-                                                                   beta_loss=self.beta_loss, iterations=self.iterations,
-                                                                   nmf_max_iter=self.nmf_max_iter,
-                                                                   metric='both')
-            mse, mad = sel_impute.run(processes)
-            res['mse'] = mse
-            res['mad'] = mad
+        if 'loocd' in self.methods:
+            sel_loocd: NMFModelSelection = NMFLOOCDSelection(
+                decomposer=decomposer,
+                k_values=self.ranks,
+                iterations=self.iterations,
+                jaccard_method="binary",
+                best_model=True,
+                relevance_type="relevance"
+            )
+            loocd = sel_loocd.run(processes)
+            res['loocd'] = loocd
+            msel_res.append(sel_loocd)
+
+        # if 'mse' in self.methods or 'mad' in self.methods:
+        #     sel_impute: NMFModelSelection = NMFImputationSelection(data, k_values=self.ranks,
+        #                                                            solver=self.solver,
+        #                                                            beta_loss=self.beta_loss, iterations=self.iterations,
+        #                                                            nmf_max_iter=self.nmf_max_iter,
+        #                                                            metric='both')
+        #     mse, mad = sel_impute.run(processes)
+        #     res['mse'] = mse
+        #     res['mad'] = mad
+        self._results = msel_res
 
         return res
 
+    def plot(self, cols: int = 6) -> go.Figure:
+        """Combine results from all methods into a single plot."""
+
+        # Get all the traces to add
+        traces: List[go.Trace] = []
+        for method in self._results:
+            for met in method._results:
+                traces += [method.traces(met)]
+        # list(
+        #     itertools.chain.from_iterable(
+        #         map(lambda x: x.traces(),
+        #             self._results)
+        #     )
+        # )
+
+        # Determine require rows and columns
+        ncol: int = min(cols, len(traces))
+        nrow: int = math.ceil(len(traces) / ncol)
+
+        # Compose plot
+        fig: go.Figure = make_subplots(rows=nrow, cols=ncol)
+        for plot_i, trace in enumerate(traces):
+            plot_row, plot_col = divmod(plot_i, ncol)
+            fig.add_traces(trace, rows=plot_row+1, cols=plot_col+1)
+
+        return fig
 
 class NMFResults:
     """Provide results for all the ranks searched by one NMFModelSelection method. Can produce plots of the values
@@ -1591,12 +1911,13 @@ class NMFResults:
             x: List[int] = list(
                 itertools.chain.from_iterable(
                     map(
-                        lambda x: (first_k + x[1]['k'],first_k + x[1]['k_1'], None),
+                        lambda x: (first_k + x[1]['k'], first_k + x[1]['k_1'], None),
                         slide.iterrows()
                     )
                 )
             )
-            y: List[float] = list(itertools.chain.from_iterable(map(lambda x: (x[1]['relevance'], x[1]['relevance'], None), slide.iterrows())))
+            y: List[float] = list(itertools.chain.from_iterable(
+                map(lambda x: (x[1]['relevance'], x[1]['relevance'], None), slide.iterrows())))
             traces += [go.Scatter(
                 x=x,
                 y=y,
@@ -1782,7 +2103,8 @@ class NMFSingleResult:
         :rtype: float
 
         """
-        return summarise.function(self.all_metrics) if summarise is not None else self.__default_summarise.function(self.__metrics)
+        return summarise.function(self.all_metrics) if summarise is not None else self.__default_summarise.function(
+            self.all_metrics)
 
     def __str__(self) -> str:
         """Return string representation of this object."""
@@ -2031,8 +2353,9 @@ def tests() -> None:
     # ))
     # Load the data we're having errors with
     data = pd.read_csv('/media/hal/safe_hal/work/nmf_otherenv/sediment/input_dump.csv', index_col=0)
-    select = NMFMultiSelect(ranks=list(range(2, 10, 1)), beta_loss='kullback-leibler', iterations=150, nmf_max_iter=10000,
-                        solver='mu', methods=['coph', 'disp'])
+    select = NMFMultiSelect(ranks=list(range(2, 10, 1)), beta_loss='kullback-leibler', iterations=150,
+                            nmf_max_iter=10000,
+                            solver='mu', methods=['coph', 'disp'])
     results = select.run(data)
     print(results['jiang'].selected.k)
     print(results['jiang'].measure().T)
@@ -2041,16 +2364,17 @@ def tests() -> None:
     visualise.multiselect_plot(results).show()
     # results.write_results('data/sample.results')
 
+
 def orientation_tests():
     # Make some synthetic data to play with
-    data: pd.DataFrame = synthdata.sparse_overlap_even(rank=14, m_overlap=0.3, n_overlap=0.3,
-                                                     size=(500, 200), noise=(0,3), p_ubiq=0.0, feature_scale=True)
+    data: pd.DataFrame = synthdata.sparse_overlap_even(rank=8, m_overlap=0.3, n_overlap=0.3,
+                                                       size=(500, 200), noise=(0, 3), p_ubiq=0.0, feature_scale=True)
     # Transpose to sk-learn orientation
     data = data.T
     # Five comm simulation
-    # data: pd.DataFrame = pd.read_csv("~/Dropbox/PHD/FunctionalAbundance/paper/figures/simulations/mosaic/ko_table.tsv",
-    #                                sep="\t", index_col=0)
-    # data = (data / data.sum(axis=0)).fillna(0).T
+    data: pd.DataFrame = pd.read_csv("~/Dropbox/PHD/FunctionalAbundance/paper/figures/simulations/five/ko_table.tsv",
+                                   sep="\t", index_col=0)
+    data = (data / data.sum(axis=0)).fillna(0).T
     # Leukemia data - classic dataset
     # data = pd.read_csv("~/Dropbox/PHD/FunctionalAbundance/paper/figures/external_data/leukemia/leukemia_data.tsv", index_col=0, sep="\t")
     # data = (data / data.sum(axis=0)).fillna(0).T
@@ -2070,28 +2394,32 @@ def orientation_tests():
         options=opts,
         seed=5345432235
     )
-    # if os.path.exists("decomposer.pickle"):
-    #     with open("decomposer.pickle", 'rb') as f:
-    #         decomposer = pickle.load(f)
-    sel: NMFModelSelection = NMFLOOCDSelection(
-        k_values=list(range(10, 19)), iterations=50, decomposer=decomposer, jaccard_method="binary",
-        relevance_type="paired", best_model=True
-    )
+    if os.path.exists("decomposer.pickle"):
+        with open("decomposer.pickle", 'rb') as f:
+            decomposer = pickle.load(f)
+    # sel: NMFModelSelection = NMFPermutationSelection(
+    #     k_values=list(range(2, 5)), iterations=5, decomposer=decomposer
+    # )
     # sel2: NMFModelSelection = NMFConsensusSelection(
     #     k_values=list(range(5, 8)), iterations=50, decomposer=decomposer
     # )
-    res1 = sel.run()
+    ms = NMFMultiSelect(ranks=list(range(2, 10)), methods=['coph', 'disp'],
+                        iterations=50, nmf_max_iter=3000, solver="mu", beta_loss="kullback-leibler")
+    ig = ms.run(data, processes=1)
+    ms.plot(cols=3).show()
+    # res1 = sel.run()
     with open("decomposer.pickle", 'wb') as f:
         pickle.dump(decomposer, f)
     # res2 = sel2.run()
     # res2 = sel2.run()
     # res1 == res2
-    print(res1.results)
-    res1.table()
-    figg = res1.plot([MetricSummarise.MEAN.value, MetricSummarise.MEDIAN.value], sliding_loocd=True)
-    figg.show()
+    # print(res1.results)
+    # res1.table()
+    # figg = sel.plot()
+    # figg.show()
     # print(res2[0].results)
     # print(res2[1].results)
+
 
 def leukemia():
     pass
@@ -2100,13 +2428,15 @@ def leukemia():
     # leuk: pd.DataFrame = pd.read_csv('~/nmf/data/surface_data.csv', index_col=0).astype('float64')
     # tara.drop(columns=['description'],inplace=True)
     # select = NMFMultiSelect(ranks=(8, 8), beta_loss='kullback-leibler', iterations=10, nmf_max_iter=10000,
-                            # solver='mu', methods=['mad'])
+    # solver='mu', methods=['mad'])
     # results = select.run(leuk)
     # with open('/home/hal/nmf/rerun_surf.res', 'wb') as f:
     #     pickle.dump(results, f)
 
+
 if __name__ == "__main__":
     import cProfile
+
     prof = cProfile.Profile()
     prof.enable()
     # tests()
