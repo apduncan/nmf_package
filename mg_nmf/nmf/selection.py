@@ -706,9 +706,10 @@ class NMFModelSelection(ABC):
         x: List[int] = [x.k for x in result.metric.results]
         suggestions: List[int] = self.suggest_ranks(result)
         suggestion_chr: List[str] = list(map(lambda i: "diamond" if i in suggestions else "circle", x))
-        suggestion_chr[suggestions[0] - x[0]] = "star"
         suggestion_size: List[int] = [suggest_size if i in suggestions else 0 for i in x]
-        suggestion_size[suggestions[0] - x[0]] = suggest_size * 2
+        if len(suggestions) > 0:
+            suggestion_chr[suggestions[0] - x[0]] = "star"
+            suggestion_size[suggestions[0] - x[0]] = suggest_size * 2
         if len(result.metric.results[0].all_metrics) > 1:
             for k_res in result.metric.results:
                 traces += [go.Violin(
@@ -753,32 +754,32 @@ class NMFModelSelection(ABC):
 
         # Should only really be calculated for LOOCD results
         # if sliding_loocd:
-        #     loocd_selector: NMFLOOCDSelection = NMFLOOCDSelection(
-        #         relevance_type="relevance", jaccard_method="binary",
-        #         decomposer=NMFDecomposer(data=self.results[0].data,
-        #                                  options=NMFOptions())
-        #     )
-        #     first_k: int = self.results[0].k
-        #     slide: pd.DataFrame = loocd_selector.interank_relevance(self)
-        #     # Compose a line trace with None to break lines
-        #     x: List[int] = list(
-        #         itertools.chain.from_iterable(
-        #             map(
-        #                 lambda x: (first_k + x[1]['k'], first_k + x[1]['k_1'], None),
-        #                 slide.iterrows()
-        #             )
+        # loocd_selector: NMFLOOCDSelection = NMFLOOCDSelection(
+        #     relevance_type="relevance", jaccard_method="binary",
+        #     decomposer=NMFDecomposer(data=result.metric.results[0].data,
+        #                              options=NMFOptions())
+        # )
+        # first_k: int = result.metric.results[0].k
+        # slide: pd.DataFrame = loocd_selector.interank_relevance(self)
+        # # Compose a line trace with None to break lines
+        # x: List[int] = list(
+        #     itertools.chain.from_iterable(
+        #         map(
+        #             lambda x: (first_k + x[1]['k'], first_k + x[1]['k_1'], None),
+        #             slide.iterrows()
         #         )
         #     )
-        #     y: List[float] = list(itertools.chain.from_iterable(
-        #         map(lambda x: (x[1]['relevance'], x[1]['relevance'], None), slide.iterrows())))
-        #     traces += [go.Scatter(
-        #         x=x,
-        #         y=y,
-        #         line_color="black",
-        #         line_dash="dash",
-        #         name="best model relevance",
-        #         visible="legendonly"
-        #     )]
+        # )
+        # y: List[float] = list(itertools.chain.from_iterable(
+        #     map(lambda x: (x[1]['relevance'], x[1]['relevance'], None), slide.iterrows())))
+        # traces += [go.Scatter(
+        #     x=x,
+        #     y=y,
+        #     line_color="black",
+        #     line_dash="dash",
+        #     name="best model relevance",
+        #     visible="legendonly"
+        # )]
 
         return traces
 
@@ -790,13 +791,17 @@ class NMFModelSelection(ABC):
 
         # Detect which method to use (single/multi)
         if len(metric.metric.results[0].all_metrics) == 1:
-            return self.__suggest_sinlge(metric)
+            return list(self._suggest_single(metric)['rank'])
         else:
-            return self.__suggest_multi(metric)
+            return self._suggest_multi(metric)
 
-    def __suggest_sinlge(self, metric: NMFModelSelection.MetricResults, y: Optional[List[float]] = None) -> List[int]:
+    def _suggest_single(self,
+                        metric: NMFModelSelection.MetricResults, y: Optional[List[float]] = None,
+                        prefer_knee: bool = True) -> pd.DataFrame:
         """Suggest ranks based on a single curve. If y is specified, will use this array of y-values rather than
-        getting them from the metric object. Use this when passing a summarised curve (mean/median)."""
+        getting them from the metric object. Use this when passing a summarised curve (mean/median). This
+        implementation prefers knee points to local maxima. With Concordance, Cophenetic Correlation, and Dispersion
+        the true rank is often at the knee point rather than the peak value."""
 
         x: List[int] = [x.k for x in metric.metric.results]
         y: List[float] = [x.metric() for x in metric.metric.results] if y is None else y
@@ -809,23 +814,32 @@ class NMFModelSelection(ABC):
             direction="increasing",
             online=True
         )
-        conc_dec: kneed.KneeLocator = kneed.KneeLocator(
-            x=x,
-            y=y,
-            curve="concave",
-            direction="decreasing",
-            online=True
-        )
+        first_knee = self.first_decreasing_knee(y)
         conc_inc_lst: List[int] = sorted(conc_inc.all_knees)
-        conc_dec_lst: List[int] = sorted(conc_dec.all_knees)
-        # Discard concave-decreasing knee if it is greater than the first concave-increasing
-        candidates = conc_inc_lst if conc_dec_lst[0] > conc_inc_lst[0] else [conc_dec_lst[0]] + list(conc_inc.all_knees)
+        conc_dec_lst: List[int] = [] if first_knee is None else [first_knee[0] + x[0]]
+
+        # For the concave increasing results to be useful, the curve should have at some point experienced an
+        # increasing value. We will discard all concave increasing ranks before the first posistive delta
+        y_inc = np.where(np.ediff1d(y) > 0)[0]
+        first_inc: int = np.inf if len(y_inc) < 1 else y_inc[0] + x[0]
+        conc_inc_lst = list(filter(lambda x: x > first_inc, conc_inc_lst))
+
+        if len(conc_dec_lst) < 1:
+            # If no decreasing knee, use only increasing knee points
+            candidates = conc_inc_lst
+        elif len(conc_inc_lst) < 1:
+            # If no increasing knees, use only decreasing points
+            candidates = conc_dec_lst
+        else:
+            # Discard concave-decreasing knee if it is greater than the first concave-increasing
+            candidates = conc_inc_lst if conc_dec_lst[0] > conc_inc_lst[0] else [conc_dec_lst[0]] + list(conc_inc.all_knees)
+        knees = candidates
 
         # Look for local maxima
         local_maxima: np.array = argrelextrema(np.float32(y), np.greater)[0]
         # Apply some tolerance, so we're not picking up tiny bumps in the value
         # Defaulting to 1% of total range
-        tol: float = (max(y) - min(y)) * 0.01
+        tol: float = (max(y) - min(y)) * 0.001
         local_maxima = list(filter(
             lambda i: ((y[i] - y[i-1]) > tol) and ((y[i] - y[i+1]) > tol),
             local_maxima
@@ -841,40 +855,102 @@ class NMFModelSelection(ABC):
 
         local_maxima = [i + x[0] for i in increasing_maxima]
 
-        # Discard knees if they after a local maxima
+        # Discard knees if they are directly after a local maxima
         candidates = list(filter(lambda x: not(x - 1 in local_maxima), candidates))
         candidates += local_maxima
 
-        # With multiple candidates, sort by the number of times occurs in list (both knee and local maximum)
-        # Break ties by proximity to elbow point in reconstruction error difference graph
-        candidate_df: pd.DataFrame = pd.DataFrame(Counter(candidates).items(), columns=['rank', 'count'])
+        [knees.remove(x) for x in local_maxima if x in knees]
+
+        # With multiple candidates, find groups of candidates which are close together (within 2)
+        # Order these groups by max value, then within those prefer knee / peak based on parameter,
+        # with metric values deciding among multiple of the same type.
+        candidate_df: pd.DataFrame = (pd.DataFrame(Counter(candidates).items(), columns=['rank', 'count'])
+                                      .sort_values(by='rank', ascending=True))
         candidate_df['error'] = candidate_df['rank'].map(
             lambda x: metric.metric.result_for_k(x).model.model.reconstruction_err_)
+        candidate_df['knee'] = candidate_df['rank'].map(lambda x: x in knees)
+        candidate_df['val'] = [] if candidate_df.shape[0] == 0 else np.array(y)[np.array(candidate_df['rank']) - x[0]]
         error_knee: int = kneed.KneeLocator(x=x,
                                         y=[x.model.model.reconstruction_err_ for x in metric.metric.results],
                                         curve="convex",
                                         direction="decreasing",
                                         interp_method="polynomial"
                                        ).knee
+        # Handle the case where no knee detected in error
+        error_knee = np.inf if error_knee is None else error_knee
         candidate_df['error_knee_dist'] = abs(candidate_df['rank'] - error_knee)
-        candidate_df = candidate_df.sort_values(by=['error_knee_dist', 'rank'], ascending=[True, True])
-        candidates = list(candidate_df['rank'])
+        # Label groups
+        grp: List[int] = [0]
+        for i in range(1, candidate_df.shape[0]):
+            if abs(candidate_df.iloc[i]['rank'] - candidate_df.iloc[i - 1]['rank']) < 3:
+                grp.append(grp[-1])
+            else:
+                grp.append(grp[-1] + 1)
+        candidate_df['group'] = grp
+        candidate_df['grp_max'] = candidate_df.groupby('group')['val'].transform('max')
+        candidate_df = candidate_df.sort_values(
+            by=['grp_max', 'knee', 'val', 'error_knee_dist'],
+            ascending=[False, not prefer_knee, False, True]
+        )
 
-        return candidates
+        return candidate_df
 
-    def __suggest_multi(self, metric: NMFModelSelection.MetricResults) -> List[int]:
+    def _suggest_multi(self,
+                       metric: NMFModelSelection.MetricResults,
+                       prefer_knee: bool = True
+                       ) -> List[int]:
         """Suggest ranks where there are multiple measure values for each rank. Uses both mean and median for each rank,
         and combines these results."""
 
         # Run single suggestion for mean and median
+        suggestions: List[pd.DataFrame] = []
         for method in [mean, median]:
-            y: List[float] = [method(x.all_metrics) for x in metric.metric.results]
-            suggestions: List[int] = self.__suggest_sinlge(metric, y)
+            suggestions += [self._suggest_single(
+                metric=metric,
+                y=[method(x.all_metrics) for x in metric.metric.results]
+            )]
 
         # Where suggestions from two averaging methods are within one rank, move these to the front of
-        # the list
+        # the list, maintaining their prior order
+        candidate_df: pd.DataFrame = pd.concat(suggestions).sort_values(by="rank", ascending=True)
+        grp: List[int] = [0]
+        for i in range(1, candidate_df.shape[0]):
+            if abs(candidate_df.iloc[i]['rank'] - candidate_df.iloc[i - 1]['rank']) < 3:
+                grp.append(grp[-1])
+            else:
+                grp.append(grp[-1] + 1)
+        candidate_df['group'] = grp
+        candidate_df['grp_max'] = candidate_df.groupby('group')['val'].transform('max')
+        candidate_df = candidate_df.sort_values(
+            by=['grp_max', 'knee', 'val', 'error_knee_dist'],
+            ascending=[False, not prefer_knee, False, True]
+        )
 
-        raise NotImplemented
+        return list(candidate_df['rank'])
+
+    @staticmethod
+    def first_decreasing_knee(y: np.array) -> Optional[Tuple[int, float]]:
+        """Find the first concave increasing knee in a line. Sometimes the default sensitivity of 0 fails to find the
+        first knee, so will search for the first value which produces a knee."""
+
+        # Want to work only with the subset of the line which is an initial decrease
+        y_inc = np.where(np.ediff1d(y) > 0)[0]
+        first_inc: int = np.inf if len(y_inc) < 1 else y_inc[0]
+        # If the line immediately increases, return None as there is no initial decrease knee
+        if first_inc < 3:
+            return None
+        y_sub = y[:first_inc]
+        for sens in np.linspace(0.95, 0, 100):
+            knee = kneed.KneeLocator(x=list(range(len(y_sub))),
+                                     y=y_sub,
+                                     curve="concave",
+                                     direction="decreasing",
+                                     S=sens,
+                                     online=True)
+            if len(knee.all_knees) > 0:
+                knee_list: List[int] = sorted(list(knee.all_knees))
+                return knee_list[0], y[knee_list[0]]
+        return None
 
 # noinspection SpellCheckingInspection
 class NMFConsensusSelection(NMFModelSelection):
@@ -1164,8 +1240,6 @@ class NMFSplitHalfSelection(NMFModelSelection):
             H_2_class: np.ndarray = np.argmax(H_2.values, axis=0)
             ari: float = adjusted_rand_score(H_1_class, H_2_class)
             aris.append(ari)
-        ari_median: float = np.median(aris)
-        ari_mean: float = np.mean(aris)
 
         # Can't return a model, as not trained on full data. Return all other parts of results.
         return NMFSingleResult(
@@ -1178,7 +1252,99 @@ class NMFSplitHalfSelection(NMFModelSelection):
             default_summarise=MetricSummarise.MEAN.value
         )
 
+    def _suggest_single(self,
+                        metric: NMFModelSelection.MetricResults,
+                        y: Optional[List[float]] = None,
+                        prefer_knee: bool = False) -> List[int]:
+        """Suggest suitable ranks based on distribution of ARI values from Split-Half model selection. The results from
+        this method have no attached model as they were all trained on different splits of the data, so the step of
+        looking for proximity to the reconstruction error knee is omitted."""
 
+        x: List[int] = [x.k for x in metric.metric.results]
+        y: List[float] = [x.metric() for x in metric.metric.results] if y is None else y
+
+        # Look for concave-increasing knees and concave-decreasing knees
+        conc_inc: kneed.KneeLocator = kneed.KneeLocator(
+            x=x,
+            y=y,
+            curve="concave",
+            direction="increasing",
+            online=True
+        )
+        conc_dec: kneed.KneeLocator = kneed.KneeLocator(
+            x=x,
+            y=y,
+            curve="concave",
+            direction="decreasing",
+            online=True
+        )
+        conc_inc_lst: List[int] = sorted(conc_inc.all_knees)
+        conc_dec_lst: List[int] = sorted(conc_dec.all_knees)
+
+        # For the concave increasing results to be useful, the curve should have at some point experienced an
+        # increasing value. We will discard all concave increasing ranks before the first posistive delta
+        y_inc = np.where(np.ediff1d(conc_inc_lst) > 0)[0]
+        first_inc: int = np.inf if len(y_inc) < 1 else y_inc[0] + x[0]
+        conc_inc_lst = list(filter(lambda x: x > first_inc, conc_inc_lst))
+
+        if len(conc_dec_lst) < 1:
+            # If no decreasing knee, use only increasing knee points
+            candidates = conc_inc_lst
+        elif len(conc_inc_lst) < 1:
+            # If no increasing knees, use only decreasing points
+            candidates = conc_dec_lst
+        else:
+            # Discard concave-decreasing knee if it is greater than the first concave-increasing
+            candidates = conc_inc_lst if conc_dec_lst[0] > conc_inc_lst[0] else [conc_dec_lst[0]] + list(
+                conc_inc.all_knees)
+        knees = candidates
+
+        # Look for local maxima
+        local_maxima: np.array = argrelextrema(np.float32(y), np.greater)[0]
+        # Apply some tolerance, so we're not picking up tiny bumps in the value
+        # Defaulting to 1% of total range
+        tol: float = (max(y) - min(y)) * 0.01
+        local_maxima = list(filter(
+            lambda i: ((y[i] - y[i - 1]) > tol) and ((y[i] - y[i + 1]) > tol),
+            local_maxima
+        ))
+        # Any local maxima has to be an improvement on the prior
+        increasing_maxima: List[int] = []
+        curr_max: float = -np.inf
+        for i_max in local_maxima:
+            val: float = y[i_max]
+            if val > curr_max:
+                increasing_maxima.append(i_max)
+                curr_max = val
+
+        local_maxima = [i + x[0] for i in increasing_maxima]
+
+        # Discard knees if they are after a local maxima
+        candidates = list(filter(lambda x: not (x - 1 in local_maxima), candidates))
+        candidates += local_maxima
+
+        # With multiple candidates, sort by the number of times occurs in list (both knee and local maximum)
+        # Break ties by proximity to elbow point in reconstruction error difference graph
+        candidate_df: pd.DataFrame = pd.DataFrame(Counter(candidates).items(), columns=['rank', 'count'])
+        candidate_df['knee'] = candidate_df['rank'].map(lambda x: x in knees)
+        candidate_df['val'] = [] if candidate_df.shape[0] == 0 else np.array(y)[np.array(candidate_df['rank']) - x[0]]
+        candidate_df['error_knee_dist'] = 0
+        candidate_df = candidate_df.sort_values(by=['knee', 'count', 'rank'], ascending=[not prefer_knee, False, True])
+        candidates = list(candidate_df['rank'])
+
+        # Where no candidates have been identified, return the lowest rank searched
+        candidates = [x[0]] if len(candidates) < 1 else candidates
+
+        return candidate_df
+
+    def _suggest_multi(self,
+                       metric: NMFModelSelection.MetricResults,
+                       prefer_knee: bool = False
+                       ) -> List[int]:
+        return super()._suggest_multi(
+            metric=metric,
+            prefer_knee=prefer_knee
+        )
 # noinspection SpellCheckingInspection
 class NMFPermutationSelection(NMFModelSelection):
     """
@@ -1280,6 +1446,21 @@ class NMFPermutationSelection(NMFModelSelection):
                     return None, None
             # Save the current model - will want to return them if next k shows levelling of slope
             prev_rmodel: NMFModel = reg_model
+
+    def _suggest_single(self, metric: NMFModelSelection.MetricResults, y: Optional[List[float]] = None) -> List[int]:
+        """Suggest suitable ranks based on Permutation results. This suggest the local maxima, in descending order."""
+
+        x: List[int] = [x.k for x in metric.metric.results]
+        y: List[float] = [x.metric() for x in metric.metric.results] if y is None else y
+
+        local_maxima: np.array = argrelextrema(np.float32(y), np.greater)[0]
+        maxima_vals: np.array = np.array(y)[local_maxima]
+
+        candidate_df: pd.DataFrame = (pd.DataFrame(zip(local_maxima, maxima_vals), columns=['rank', 'val'])
+                                      .sort_values(by=['val'], ascending=[False]))
+        candidate_df['rank'] = candidate_df['rank'] + x[0]
+
+        return candidate_df
 
 
 class NMFImputationSelection(NMFModelSelection):
@@ -1562,6 +1743,23 @@ class NMFLOOCDSelection(NMFModelSelection):
 
         return measure
 
+    def _suggest_single(self,
+                        metric: NMFModelSelection.MetricResults, y: Optional[List[float]] = None,
+                        prefer_knee: bool = False) -> List[int]:
+        return super()._suggest_single(
+            metric=metric,
+            y=y,
+            prefer_knee=prefer_knee
+        )
+
+    def _suggest_multi(self,
+                       metric: NMFModelSelection.MetricResults,
+                       prefer_knee: bool = False
+                       ) -> List[int]:
+        return super()._suggest_multi(
+            metric=metric,
+            prefer_knee=prefer_knee
+        )
 
 class NMFMultiSelect:
     """Run multiple model selection criteria on a single set of data.
@@ -1670,7 +1868,7 @@ class NMFMultiSelect:
         self.__beta_loss: str = beta_loss
 
     # noinspection SpellCheckingInspection
-    def run(self, data: pd.DataFrame, processes: int = 1) -> Dict[str, NMFResults]:
+    def run(self, data: pd.DataFrame, processes: int = 1, decomposer: NMFDecomposer = None) -> Dict[str, NMFResults]:
         """Run each of the selected methods for the provided data."""
 
         options: NMFOptions = NMFOptions(
@@ -1678,12 +1876,13 @@ class NMFMultiSelect:
             beta_loss=BetaLoss.KULLBACK_LEIBLER,
             nmf_max_iter=self.nmf_max_iter
         )
-        decomposer: NMFDecomposer = NMFDecomposer(
-            data=data,
-            options=options,
-            cache=True,
-            processes=processes,
-        )
+        if decomposer is None:
+            decomposer: NMFDecomposer = NMFDecomposer(
+                data=data,
+                options=options,
+                cache=True,
+                processes=processes,
+            )
 
         res: Dict[str, NMFResults] = {}
         msel_res: List[NMFModelSelection] = []
@@ -2367,14 +2566,14 @@ def tests() -> None:
 
 def orientation_tests():
     # Make some synthetic data to play with
-    data: pd.DataFrame = synthdata.sparse_overlap_even(rank=8, m_overlap=0.3, n_overlap=0.3,
-                                                       size=(500, 200), noise=(0, 3), p_ubiq=0.0, feature_scale=True)
+    data: pd.DataFrame = synthdata.sparse_overlap_even(rank=6, m_overlap=0.3, n_overlap=0.3,
+                                                       size=(500, 100), noise=(0, 3), p_ubiq=0.0, feature_scale=True)
     # Transpose to sk-learn orientation
     data = data.T
     # Five comm simulation
-    data: pd.DataFrame = pd.read_csv("~/Dropbox/PHD/FunctionalAbundance/paper/figures/simulations/five/ko_table.tsv",
-                                   sep="\t", index_col=0)
-    data = (data / data.sum(axis=0)).fillna(0).T
+    # data: pd.DataFrame = pd.read_csv("~/Dropbox/PHD/FunctionalAbundance/paper/figures/simulations/five/ko_table.tsv",
+    #                                sep="\t", index_col=0)
+    # data = (data / data.sum(axis=0)).fillna(0).T
     # Leukemia data - classic dataset
     # data = pd.read_csv("~/Dropbox/PHD/FunctionalAbundance/paper/figures/external_data/leukemia/leukemia_data.tsv", index_col=0, sep="\t")
     # data = (data / data.sum(axis=0)).fillna(0).T
@@ -2394,19 +2593,19 @@ def orientation_tests():
         options=opts,
         seed=5345432235
     )
-    if os.path.exists("decomposer.pickle"):
-        with open("decomposer.pickle", 'rb') as f:
-            decomposer = pickle.load(f)
+    # if os.path.exists("decomposer.pickle"):
+    #     with open("decomposer.pickle", 'rb') as f:
+    #         decomposer = pickle.load(f)
     # sel: NMFModelSelection = NMFPermutationSelection(
     #     k_values=list(range(2, 5)), iterations=5, decomposer=decomposer
     # )
     # sel2: NMFModelSelection = NMFConsensusSelection(
     #     k_values=list(range(5, 8)), iterations=50, decomposer=decomposer
     # )
-    ms = NMFMultiSelect(ranks=list(range(2, 10)), methods=['coph', 'disp'],
-                        iterations=50, nmf_max_iter=3000, solver="mu", beta_loss="kullback-leibler")
+    ms = NMFMultiSelect(ranks=list(range(2, 11)), methods=['loocd', 'conc', 'disp', 'coph'],
+                        iterations=25, nmf_max_iter=3000, solver="mu", beta_loss="kullback-leibler")
     ig = ms.run(data, processes=1)
-    ms.plot(cols=3).show()
+    ms.plot(cols=4).show()
     # res1 = sel.run()
     with open("decomposer.pickle", 'wb') as f:
         pickle.dump(decomposer, f)
@@ -2434,13 +2633,81 @@ def leukemia():
     #     pickle.dump(results, f)
 
 
+def draft_paper_plot():
+    # Make a plot showing rank selection for 2 variously complex synthetic datasets, 2 simulations, and 2 real world
+    # datasets
+    store_root = "/home/hal/Dropbox/PHD/FunctionalAbundance/paper/figures/rank_selection"
+    simple_synth: pd.DataFrame = synthdata.sparse_overlap_even(rank=5, m_overlap=0.2, n_overlap=0.2,
+                                                       size=(500, 150), noise=(0, 1), p_ubiq=0.0, feature_scale=True).T
+    complex_synth: pd.DataFrame = synthdata.sparse_overlap_even(rank=12, m_overlap=0.3, n_overlap=0.3,
+                                                               size=(500, 150), noise=(0, 3), p_ubiq=0.0,
+                                                               feature_scale=True).T
+
+    datasets = [
+        ('Simple<br />Synthetic', simple_synth, 'simple_synth', 5),
+        ('Complex<br />Synthetic', complex_synth, 'complex_synth', 12),
+        ('Five<br />Genome<br />Simulation', "~/Dropbox/PHD/FunctionalAbundance/paper/figures/simulations/five/ko_table.tsv", 'simple_sim', 5),
+        ('Ocean<br />Simulation', "~/Dropbox/PHD/FunctionalAbundance/paper/figures/simulations/mosaic/ko_table.tsv", 'ocean_sim', 4),
+        ('Leukemia<br />Data', "~/Dropbox/PHD/FunctionalAbundance/paper/figures/external_data/leukemia/leukemia_data.tsv", 'leukemia', 3),
+        # ('HMP', simple_synth, 'human_microbiome'),
+        # ('Enterosignatures', simple_synth, 'enterosignatures'),
+    ]
+
+    fig = make_subplots(rows=len(datasets), cols=6, row_titles=[x[0] for x in datasets],
+                        column_titles=['Cophenetic Correlation', 'Dispersion', 'Concordance', 'Permutation',
+                                       'Split Half', 'LOOCD'])
+    row = 1
+    for title, data, loc, true_k in datasets:
+        pickle_loc = os.path.join(store_root, f'{loc}.pickle')
+        if os.path.exists(pickle_loc):
+            with open(pickle_loc, 'rb') as f:
+                ms_res = pickle.load(f)
+        else:
+            # Generate results
+            if not isinstance(data, pd.DataFrame):
+                data = pd.read_csv(data, sep="\t", index_col=0)
+                data = (data / data.sum(axis=0)).fillna(0).T
+            ms_res = NMFMultiSelect(
+                ranks=list(range(2, 17)),
+                methods=['loocd', 'coph', 'disp', 'conc', 'perm', 'split'],
+                iterations=100,
+                nmf_max_iter=3000, solver="mu", beta_loss="kullback-leibler"
+            )
+            ms_res.run(data)
+            with open(pickle_loc, 'wb') as f:
+                pickle.dump(ms_res, f)
+        # Add to subplot
+        traces: List[go.Trace] = []
+        col = 1
+        for method in ms_res._results:
+            for met in method._results:
+                traces = method.traces(met)
+                y_min = min(itertools.chain.from_iterable((x['y'] for x in traces)))
+                y_max = max(itertools.chain.from_iterable((x['y'] for x in traces)))
+                true_trace = go.Scatter(
+                    x=[true_k, true_k],
+                    y=[y_min, y_max],
+                    showlegend=False,
+                    mode="lines",
+                    line_color="grey"
+                )
+                fig.add_trace(true_trace, row=row, col=col)
+                fig.add_traces(traces, rows=row, cols=col)
+                col += 1
+        fig.show()
+        row += 1
+    fig.update_yaxes(showticklabels=False)
+    fig.update_traces(line_width=2, showlegend=False, selector=dict(type="scatter"))
+    fig.update_traces(line_width=1, marker_size=3, selector=dict(type="violin"))
+    fig.show()
+
 if __name__ == "__main__":
     import cProfile
 
-    prof = cProfile.Profile()
-    prof.enable()
+    # prof = cProfile.Profile()
+    # prof.enable()
     # tests()
-    orientation_tests()
-    prof.disable()
-    prof.dump_stats("refactor.stats")
+    draft_paper_plot()
+    # prof.disable()
+    # prof.dump_stats("refactor.stats")
     # leukemia()
