@@ -693,7 +693,7 @@ class NMFModelSelection(ABC):
             subplot_titles=list(map(lambda x: x.name, self._results))
         )
         for i, res in enumerate(self._results):
-            fig.add_traces(self.traces(res), rows=1, cols=i + 1, suggest_size=suggest_size)
+            fig.add_traces(self.traces(res, suggest_size=suggest_size), rows=1, cols=i + 1)
         return fig
 
     def traces(self, result: NMFModelSelection.MetricResults, suggest_size: int = 5) -> List[go.Trace]:
@@ -935,7 +935,8 @@ class NMFModelSelection(ABC):
 
         # Want to work only with the subset of the line which is an initial decrease
         y_inc = np.where(np.ediff1d(y) > 0)[0]
-        first_inc: int = np.inf if len(y_inc) < 1 else y_inc[0]
+        # If y never increases, use the whole line
+        first_inc: int = len(y) if len(y_inc) < 1 else y_inc[0]
         # If the line immediately increases, return None as there is no initial decrease knee
         if first_inc < 3:
             return None
